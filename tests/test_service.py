@@ -5,7 +5,6 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
-from http.server import ThreadingHTTPServer
 
 import monitor
 from tests.fixtures import SyntheticCollector
@@ -16,7 +15,7 @@ class FixtureServiceTests(unittest.TestCase):
         self.guard = patch.object(monitor.Collector, '__init__', side_effect=AssertionError('Live collection forbidden'))
         self.guard.start()
         self.addCleanup(self.guard.stop)
-        self.server = ThreadingHTTPServer(('127.0.0.1', 0), monitor.Handler)
+        self.server = monitor.LoopbackHTTPServer(('127.0.0.1', 0), monitor.Handler)
         self.server.token = 'synthetic-session-token'
         self.server.engine = monitor.Engine(factory=SyntheticCollector)
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval': .02})
@@ -55,6 +54,13 @@ class FixtureServiceTests(unittest.TestCase):
         status, _, data = self.request('/api/' + path, body)
         self.assertEqual(status, 200, data)
         return json.loads(data)
+
+    def test_loopback_binding_never_calls_reverse_dns(self):
+        with patch('socket.getfqdn', side_effect=AssertionError('Reverse DNS forbidden')):
+            server = monitor.LoopbackHTTPServer(('127.0.0.1', 0), monitor.Handler)
+        self.addCleanup(server.server_close)
+        self.assertEqual(server.server_name, '127.0.0.1')
+        self.assertGreater(server.server_port, 0)
 
     def test_telemetry_requires_exact_session_cookie(self):
         self.assertEqual(self.request('/api/state', authorized=False)[0], 403)

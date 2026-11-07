@@ -15,6 +15,7 @@ import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from urllib.parse import urlsplit
 import psutil
 from temperatures import SMCTemperatures, summarize as unavailable_temperatures
@@ -396,6 +397,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200,self.server.engine.state(body.get('after',-1)))
         except (ValueError,TypeError): return self.reply(400,{'error':'Invalid request or a scan is already active'})
 
+class LoopbackHTTPServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer normally performs reverse DNS here. This local-only
+        # service needs the literal bound address and must start without DNS.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def main():
     parser=argparse.ArgumentParser(); parser.add_argument('--port',type=int,default=8766)
     parser.add_argument('--desktop',action='store_true')
@@ -408,7 +417,7 @@ def main():
         parent_watch=select.kqueue()
         parent_watch.control([select.kevent(args.parent_pid,filter=select.KQ_FILTER_PROC,
             flags=select.KQ_EV_ADD|select.KQ_EV_ONESHOT,fflags=select.KQ_NOTE_EXIT)],0,0)
-    server=ThreadingHTTPServer(('127.0.0.1',args.port),Handler)
+    server=LoopbackHTTPServer(('127.0.0.1',args.port),Handler)
     server.token=secrets.token_urlsafe(32); server.engine=Engine()
     def shutdown(*_):
         server.engine.stop('App closed')
