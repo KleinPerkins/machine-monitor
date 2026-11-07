@@ -30,3 +30,17 @@ agent-learnings.md
 ._*
 *.swp
 # END KleinPerkins/dev baseline
+
+# Machine Monitor generated files
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+build/
+dist/
+outputs/
+*.log
+*.zip
+*.app/
+.env
+.env.*

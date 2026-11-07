@@ -11,3 +11,10 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 5
 # END KleinPerkins/dev baseline
+
+  # Application dependencies; separate from the managed Actions baseline.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
