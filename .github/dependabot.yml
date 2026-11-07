@@ -1,0 +1,13 @@
+# BEGIN KleinPerkins/dev baseline (managed by KleinPerkins/dev; do not hand-edit — see _ops/baseline/README.md in KleinPerkins/dev)
+# Actions-only Dependabot config. Keeps actions/checkout and any other pinned actions current for
+# whatever Actions workflows a repo still keeps (the shared baseline workflow was removed 2026-07;
+# see _ops/baseline/README.md). Scope is deliberately narrow (github-actions only, weekly) — no
+# per-language ecosystems (those are a repo-specific choice, not part of the uniform floor).
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+# END KleinPerkins/dev baseline

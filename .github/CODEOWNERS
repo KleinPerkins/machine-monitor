@@ -1,0 +1,5 @@
+# CODEOWNERS — default baseline owner, installed by KleinPerkins/dev repo-baseline.
+# Created ONLY when a repo has no existing CODEOWNERS file; re-running `repo-baseline.sh apply`
+# never touches a CODEOWNERS file that is already present (see _ops/baseline/README.md in
+# KleinPerkins/dev). Edit freely once created — this file is NOT re-rendered on later runs.
+* @KleinPerkins

@@ -1,0 +1,14 @@
+{
+  "aggregate": "ci-required",
+  "discovery": {
+    "exclude": [],
+    "include": [
+      "test_*.py",
+      "tests/**/*",
+      "Tests/**/*"
+    ]
+  },
+  "schema": "dev-test-sharding/v1",
+  "shards": [],
+  "state": "pending"
+}

@@ -1,0 +1,1 @@
+{"commit_hook":"identity-session-data-registration","data_guard":"installed","identity_guard":"installed","registration_guard":"installed","schema":"doc-warden/guard-state/v1","session_lock":"installed","worktree_policy":"host-governed"}
