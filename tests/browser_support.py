@@ -17,6 +17,15 @@ def run(script,output):
         info=ready(proc)
         environment=dict(os.environ,MONITOR_TEST_URL=f"http://127.0.0.1:{info['port']}",MONITOR_TEST_OUTPUT=str(output))
         subprocess.run([sys.executable,str(ROOT/script)],cwd=ROOT,env=environment,check=True,timeout=150)
+    except BaseException:
+        # Keep fixture-only startup failures observable after bounded cleanup.
+        if proc.poll() is None:
+            proc.terminate()
+            try:proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:proc.kill();proc.wait()
+        diagnostics=proc.stderr.read(8192).decode(errors='replace')
+        if diagnostics:print('Fixture service diagnostics:\n'+diagnostics,file=sys.stderr)
+        raise
     finally:
         if proc.poll() is None:
             proc.terminate()
