@@ -33,6 +33,14 @@ def build(destination):
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / name, path)
+        spec = importlib.util.spec_from_file_location('fixture_app_builder', root / 'build_mac_app.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        # Qualify the unchanged production entrypoint too; never launch it in CI.
+        module.build()
+        run_build(['codesign', '--verify', '--deep', '--strict', str(root / 'dist/Machine Monitor.app')])
+        shutil.rmtree(root / 'dist')
+        shutil.rmtree(root / 'build/frozen')
         args = [sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--noupx',
                 '--name', 'monitor-service', '--paths', str(root),
                 '--distpath', str(root / 'build/frozen'), '--workpath', str(root / 'build/freezer'),
@@ -41,9 +49,6 @@ def build(destination):
             args += ['--add-data', f'{root / asset}:.']
         environment = dict(os.environ, PYINSTALLER_CONFIG_DIR=str(root / 'build/pyinstaller-cache'))
         run_build(args + [str(root / 'tests/fixture_service.py')], cwd=root, env=environment)
-        spec = importlib.util.spec_from_file_location('fixture_app_builder', root / 'build_mac_app.py')
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
         module.build(reuse_helper=True)
         app = root / 'dist/Machine Monitor.app'
         plist = app / 'Contents/Info.plist'
