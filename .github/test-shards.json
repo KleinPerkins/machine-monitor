@@ -1,14 +1,94 @@
 {
+  "schema": "dev-test-sharding/v1",
+  "state": "configured",
   "aggregate": "ci-required",
   "discovery": {
-    "exclude": [],
     "include": [
       "test_*.py",
-      "tests/**/*",
-      "Tests/**/*"
-    ]
+      "tests/**/test_*.py"
+    ],
+    "exclude": []
   },
-  "schema": "dev-test-sharding/v1",
-  "shards": [],
-  "state": "pending"
+  "shards": [
+    {
+      "id": "governance",
+      "tests": [
+        "tests/test_governance.py",
+        "tests/test_automation.py"
+      ],
+      "command": [
+        "python3",
+        "scripts/verify.py",
+        "governance"
+      ],
+      "timeout_seconds": 600
+    },
+    {
+      "id": "core",
+      "tests": [
+        "test_monitor.py",
+        "test_temperatures.py"
+      ],
+      "command": [
+        "python3",
+        "scripts/verify.py",
+        "core"
+      ],
+      "timeout_seconds": 600
+    },
+    {
+      "id": "service",
+      "tests": [
+        "tests/test_service.py"
+      ],
+      "command": [
+        "python3",
+        "scripts/verify.py",
+        "service"
+      ],
+      "timeout_seconds": 600
+    },
+    {
+      "id": "browser-layout",
+      "tests": [
+        "test_hover_layout.py",
+        "test_rollup_browser.py",
+        "test_temperature_browser.py",
+        "test_scenarios.py"
+      ],
+      "command": [
+        "python3",
+        "scripts/verify.py",
+        "browser-layout"
+      ],
+      "timeout_seconds": 600
+    },
+    {
+      "id": "browser-lifecycle",
+      "tests": [
+        "test_browser.py",
+        "test_scan_reset.py",
+        "test_desktop_visibility.py"
+      ],
+      "command": [
+        "python3",
+        "scripts/verify.py",
+        "browser-lifecycle"
+      ],
+      "timeout_seconds": 600
+    },
+    {
+      "id": "native-app",
+      "tests": [
+        "test_desktop_service.py",
+        "tests/test_native_app.py"
+      ],
+      "command": [
+        "python3",
+        "scripts/verify.py",
+        "native-app"
+      ],
+      "timeout_seconds": 1200
+    }
+  ]
 }

@@ -1,0 +1,91 @@
+name: Reviewer App
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+permissions:
+  contents: read
+  actions: read
+  checks: read
+concurrency:
+  group: machine-monitor-reviewer
+  cancel-in-progress: false
+jobs:
+  approve-and-arm:
+    # Staged until secure owner setup and qualification enable this repository variable.
+    if: >-
+      vars.REVIEWER_APP_ENABLED == 'true' &&
+      github.repository == 'KleinPerkins/machine-monitor' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      # Execute only the trusted workflow revision. Never fetch PR source/artifacts here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            scripts/
+            .planning/doc-warden.json
+      - name: Mint repository-scoped reviewer token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.AUTOMERGE_APP_ID }}
+          private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
+          owner: KleinPerkins
+          repositories: machine-monitor
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Approve the verified ordinary head and arm native squash auto-merge
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          CI_READ_TOKEN: ${{ github.token }}
+          REVIEWER_LOGIN: ${{ steps.app.outputs.app-slug }}[bot]
+        run: python3 scripts/auto_merge.py
+  qualify:
+    # Read-only qualification after secure owner provisioning; no PR writes here.
+    if: >-
+      vars.REVIEWER_APP_QUALIFY == 'true' &&
+      github.repository == 'KleinPerkins/machine-monitor' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            scripts/
+            .planning/doc-warden.json
+      - name: Mint repository-scoped qualification token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.AUTOMERGE_APP_ID }}
+          private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
+          owner: KleinPerkins
+          repositories: machine-monitor
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Verify current-main CI, effective controls and App scope
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          CI_READ_TOKEN: ${{ github.token }}
+          REVIEWER_LOGIN: ${{ steps.app.outputs.app-slug }}[bot]
+        run: python3 scripts/qualify_reviewer.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reviewer-readiness
+          path: outputs/reviewer-readiness.json
+          if-no-files-found: error
+          retention-days: 14
