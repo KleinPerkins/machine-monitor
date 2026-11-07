@@ -16,7 +16,7 @@ from merge_controls import verify_controls
 PROTECTED = (
     '.github/*', '.githooks/*', '.gitleaks*', '.gitignore', '.planning/*',
     '.codex/*', '.cursor/*', '.claude/*', '.agents/*', '_ops/*', 'docs/*',
-    'AGENTS.md', 'SECURITY.md', 'CODEOWNERS', 'LICENSE*', 'THIRD-PARTY-NOTICES.md',
+    'AGENTS.md', 'README.md', 'SECURITY.md', 'CODEOWNERS', 'LICENSE*', 'THIRD-PARTY-NOTICES.md',
     'Makefile', 'scripts/*', 'tests/*', 'test_*.py', 'requirements*.txt',
     'build_mac_app.py', 'mac/*', 'start.sh',
 )

@@ -28,7 +28,7 @@ class OrdinaryHeadPolicy(unittest.TestCase):
 
     def test_all_governance_packaging_and_verification_paths_are_protected(self):
         names = ['.github/workflows/ci.yml', '.github/test-shards.json', '.github/CODEOWNERS',
-                 '.planning/doc-warden.json', '_ops/POLICY.md', 'AGENTS.md', 'SECURITY.md',
+                 '.planning/doc-warden.json', '_ops/POLICY.md', 'AGENTS.md', 'README.md', 'SECURITY.md',
                  'Makefile', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'requirements.txt',
                  'build_mac_app.py', 'mac/MachineMonitor.swift', 'scripts/verify.py',
                  'tests/test_service.py', 'test_monitor.py', '.gitignore', '.githooks/pre-commit']
