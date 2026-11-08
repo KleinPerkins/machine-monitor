@@ -53,7 +53,8 @@ def verify_identity(app, expected=None):
         if len(encoded)>65536: raise ValueError()
         info = plistlib.loads(encoded)
         executable = info['CFBundleExecutable']
-        if not isinstance(executable,str) or not re.fullmatch(r'[A-Za-z0-9._-]+',executable):
+        if (not isinstance(executable,str) or executable != executable.strip() or
+            not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._ -]{0,127}',executable)):
             raise ValueError()
         identity = {'bundle_id':info['CFBundleIdentifier'],'team_id':TEAM_ID,
                     'version':info['CFBundleShortVersionString'],'build':int(info['CFBundleVersion']),

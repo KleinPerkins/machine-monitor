@@ -37,7 +37,17 @@ final class UpdateOperationState {
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { close(fd); throw UpdateFailure.busy }
         descriptor = fd
     }
-    func unlock() { if descriptor >= 0 { flock(descriptor, LOCK_UN); close(descriptor); descriptor = -1 } }
+    // Close this reference only; an inherited preparation reference must keep
+    // its shared open-file-description lock if the parent exits first.
+    func unlock() { if descriptor >= 0 { close(descriptor); descriptor = -1 } }
+    func preparationLock() throws -> FileHandle {
+        precondition(descriptor >= 0)
+        // Always differ from the stdio destination: dup2 then clears CLOEXEC
+        // even when the original app was launched with stderr closed.
+        let fd = fcntl(descriptor, F_DUPFD_CLOEXEC, 4)
+        guard fd >= 4 else { throw UpdateFailure.invalid("preparation lock") }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    }
     func read(_ name: String) throws -> [String: Any]? {
         precondition(descriptor >= 0)
         let path = directory.appendingPathComponent(name).path
@@ -179,7 +189,31 @@ final class UpdateOperationState {
                   let receipt = try read("acceptance.json"), receipt["transaction_id"] as? String == transaction,
                   receipt["target_path"] as? String == target.path, receipt["build"] as? Int == expectedBuild,
                   build == expectedBuild else { throw UpdateFailure.recovery }
-            try verify(build); disposition = .ordinary; return disposition
+            try verify(build); try cleanupBootAdoption(transaction: transaction, build: build)
+            disposition = .ordinary; return disposition
+        }
+        if phase == "installer-pending", let previousBoot = j["boot_id"] as? String, previousBoot != bootID {
+            // This is a separate explicit-next-open path, not an updater marker
+            // exception. A changed OS boot proves old-boot installers have ended.
+            guard UUID(uuidString: previousBoot)?.uuidString.lowercased() == previousBoot,
+                  UUID(uuidString: bootID)?.uuidString.lowercased() == bootID,
+                  build == expectedBuild, marker == nil, try read("relaunch-consumed.json") == nil,
+                  try read("preparation.json") == nil, try read("boot-adoption.json") == nil
+            else { throw UpdateFailure.recovery }
+            if let recovery = try read("recovery.json") {
+                guard recovery["schema"] as? String == "machine-monitor/recovery-journal/v1",
+                      recovery["target_path"] as? String == target.path,
+                      ["accepted", "rolled-back"].contains(recovery["phase"] as? String ?? "")
+                else { throw UpdateFailure.recovery }
+            }
+            // Caller validates the manifest, signed runtime binding, identity,
+            // build/version and platform before this durable adoption intent.
+            try verify(expectedBuild)
+            try write("boot-adoption.json", ["schema": "machine-monitor/boot-adoption/v1", "transaction_id": transaction,
+                "target_path": target.path, "old_boot_id": previousBoot, "new_boot_id": bootID, "expected_build": expectedBuild])
+            needsAcceptance = true; disposition = .ordinary
+            try transition("replacement-observed")
+            return disposition
         }
         guard ["installer-pending", "replacement-observed"].contains(phase), build == expectedBuild,
               j["boot_id"] as? String == bootID else { throw UpdateFailure.recovery }
@@ -228,7 +262,23 @@ final class UpdateOperationState {
             "target_path": target.path, "build": build, "boot_id": bootID])
         // Removing the consumed marker before accepting leaves a recoverable pending journal on crash.
         unlink(directory.appendingPathComponent("relaunch-consumed.json").path); try syncDirectory()
-        try transition("accepted"); needsAcceptance = false
+        try transition("accepted"); try cleanupBootAdoption(transaction: j["transaction_id"] as! String, build: build)
+        needsAcceptance = false
+    }
+    private func cleanupBootAdoption(transaction: String, build: Int) throws {
+        guard let adoption = try read("boot-adoption.json") else { return }
+        guard Set(adoption.keys) == Set(["schema", "transaction_id", "target_path", "old_boot_id", "new_boot_id", "expected_build"]),
+              adoption["schema"] as? String == "machine-monitor/boot-adoption/v1", adoption["transaction_id"] as? String == transaction,
+              adoption["target_path"] as? String == target.path, adoption["expected_build"] as? Int == build,
+              let oldBoot = adoption["old_boot_id"] as? String, let newBoot = adoption["new_boot_id"] as? String,
+              oldBoot != newBoot, UUID(uuidString: oldBoot)?.uuidString.lowercased() == oldBoot,
+              UUID(uuidString: newBoot)?.uuidString.lowercased() == newBoot,
+              let receipt = try read("acceptance.json"), receipt["transaction_id"] as? String == transaction,
+              receipt["target_path"] as? String == target.path, receipt["build"] as? Int == build,
+              receipt["boot_id"] as? String == newBoot
+        else { throw UpdateFailure.recovery }
+        guard unlink(directory.appendingPathComponent("boot-adoption.json").path) == 0 else { throw UpdateFailure.recovery }
+        try syncDirectory()
     }
     static func currentBootID() throws -> String {
         var length = 0

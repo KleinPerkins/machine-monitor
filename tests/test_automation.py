@@ -31,7 +31,9 @@ class OrdinaryHeadPolicy(unittest.TestCase):
                  '.planning/doc-warden.json', '_ops/POLICY.md', 'AGENTS.md', 'README.md', 'SECURITY.md',
                  'Makefile', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'requirements.txt',
                  'build_mac_app.py', 'mac/MachineMonitor.swift', 'scripts/verify.py',
-                 'tests/test_service.py', 'test_monitor.py', '.gitignore', '.githooks/pre-commit']
+                 'tests/test_service.py', 'test_monitor.py', '.gitignore', '.githooks/pre-commit',
+                 'delivery/wrangler.template.json','delivery/worker.mjs','delivery/schema.sql',
+                 'update_contract.py','update_preflight.py','update_recovery.py','PRIVATE-BINARY-LICENSE']
         for name in names:
             self.assertFalse(policy.eligible(pull(), run(), [name], base_sha='c'*40), name)
             self.assertFalse(policy.eligible(pull(), run(), [name.upper()], base_sha='c'*40), name)

@@ -9,6 +9,9 @@ import fcntl
 import hashlib
 import json
 import os
+import base64
+import plistlib
+import urllib.parse
 from pathlib import Path
 import re
 import shutil
@@ -23,6 +26,53 @@ from update_preflight import verify_identity, tree_digest, DISK_RESERVE, MAX_EXP
 
 JOURNAL_SCHEMA='machine-monitor/update-journal/v1'
 RECOVERY_SCHEMA='machine-monitor/recovery-journal/v1'
+
+
+def runtime_binding(path):
+    info_path=Path(path)/'Contents/Info.plist'
+    with info_path.open('rb') as stream:
+        raw=stream.read(65537)
+    if len(raw)>65536: raise UpdateError('Application runtime configuration is too large')
+    try:
+        info=plistlib.loads(raw)
+        value={key:info[field] for key,field in (
+            ('origin','MachineMonitorUpdateOrigin'),('channel','MachineMonitorUpdateChannel'),
+            ('public_ed25519_key','SUPublicEDKey'),('source_revision','MachineMonitorSourceRevision'))}
+        if any(info.get(key) is not expected for key,expected in (
+            ('SUEnableAutomaticChecks',False),('SUAllowsAutomaticUpdates',True),
+            ('SUAutomaticallyUpdate',True),('SUVerifyUpdateBeforeExtraction',True))):
+            raise ValueError()
+        validate_runtime_binding(value)
+        return value
+    except (ValueError,TypeError,KeyError,plistlib.InvalidFileException):
+        raise UpdateError('Application runtime configuration is invalid') from None
+
+
+def validate_runtime_binding(value):
+    if not isinstance(value,dict) or set(value)!={'origin','channel','public_ed25519_key','source_revision'} or any(not isinstance(x,str) for x in value.values()):
+        raise UpdateError('Invalid runtime binding fields')
+    try: url=urllib.parse.urlsplit(value['origin'])
+    except ValueError: raise UpdateError('Invalid runtime binding origin') from None
+    if url.scheme!='https' or not url.hostname or url.netloc!=url.hostname or url.path or url.query or url.fragment:
+        raise UpdateError('Invalid runtime binding origin')
+    try:
+        key=base64.b64decode(value['public_ed25519_key'],validate=True)
+        if len(key)!=32 or base64.b64encode(key).decode()!=value['public_ed25519_key']: raise ValueError()
+    except ValueError: raise UpdateError('Invalid runtime binding key') from None
+    if value['channel'] not in ('stable','qualification') or not re.fullmatch('[0-9a-f]{40}',value['source_revision']):
+        raise UpdateError('Invalid runtime binding channel or source')
+
+
+def validate_runtime_bindings(value,manifest):
+    if not isinstance(value,dict) or set(value)!={'schema','admission','target'} or value['schema']!='machine-monitor/runtime-bindings/v1':
+        raise UpdateError('Invalid runtime bindings')
+    old,new=value['admission'],value['target']
+    validate_runtime_binding(old); validate_runtime_binding(new)
+    if (old['origin']!=new['origin'] or old['public_ed25519_key']!=new['public_ed25519_key'] or
+        (old['channel'],new['channel']) not in (('stable','stable'),('qualification','qualification'),('qualification','stable')) or
+        manifest['channel']!=old['channel'] or manifest['source_revision']!=new['source_revision']):
+        raise UpdateError('Runtime transition is not authorized')
+    return value
 
 
 def boot_identity():
@@ -103,25 +153,37 @@ def sync_tree(root):
 
 
 class RecoveryStore:
-    def __init__(self,target,*,base=None,verifier=verify_identity,boot=boot_identity,fault=None):
+    def __init__(self,target,*,base=None,verifier=verify_identity,boot=boot_identity,fault=None,inherited_lock_fd=None):
         self.target=canonical_target(target,missing=True)
         self.verifier=verifier; self.boot=boot; self.fault=fault or (lambda point:None)
         base=Path(base) if base is not None else Path.home()/'Library/Application Support/Machine Monitor/Updates'
         self.base=private_dir(base)
         self.state=private_dir(self.base/hashlib.sha256(str(self.target).encode()).hexdigest())
         self.backups=private_dir(self.state/'backups')
+        self.inherited_lock_fd=inherited_lock_fd
 
     @contextmanager
     def lock(self):
-        fd=os.open(self.state/'operation.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+        path=self.state/'operation.lock'
+        inherited=self.inherited_lock_fd
+        fd=os.dup(inherited) if inherited is not None else os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+        os.set_inheritable(fd,False)
         try:
             s=os.fstat(fd)
             if not stat.S_ISREG(s.st_mode) or s.st_uid!=os.getuid() or stat.S_IMODE(s.st_mode)!=0o600 or s.st_nlink!=1:
                 raise UpdateError('Invalid update operation lock')
+            actual=path.lstat()
+            if not stat.S_ISREG(actual.st_mode) or (actual.st_dev,actual.st_ino)!=(s.st_dev,s.st_ino):
+                raise UpdateError('Inherited operation lock does not match this target')
             try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError: raise UpdateError('Quit Machine Monitor before opening Recovery') from None
+            if inherited is not None:
+                os.close(inherited); self.inherited_lock_fd=None; inherited=None
             yield
-        finally: os.close(fd)
+        finally:
+            os.close(fd)
+            if inherited is not None:
+                os.close(inherited); self.inherited_lock_fd=None
 
     def inspect(self,path,expected=None):
         path=Path(path)
@@ -162,6 +224,7 @@ class RecoveryStore:
         if not isinstance(old,dict) or not isinstance(identity,dict) or any(old.get(k)!=identity.get(k) for k in ('bundle_id','team_id','version','build','data_schema_version')) or old.get('sha256')!=backup.get('sha256'):
             raise UpdateError('Previous application authority is invalid')
         validate_manifest(value['expected'],old.get('build'))
+        validate_runtime_bindings(value.get('runtime_binding'),value['expected'])
         return value
 
     @staticmethod
@@ -287,6 +350,10 @@ class RecoveryStore:
                 raise UpdateError('Data schema is incompatible')
             candidate_path=canonical_target(candidate_path)
             candidate=self.inspect(candidate_path,manifest)
+            bindings=validate_runtime_bindings({'schema':'machine-monitor/runtime-bindings/v1',
+                'admission':runtime_binding(self.target),'target':runtime_binding(candidate_path)},manifest)
+            # Recheck the exact signed trees after reading their authenticated plist data.
+            self.verify_record(old,self.target); self.verify_record(candidate,candidate_path)
             integer(expanded_size,'expanded size',minimum=1,maximum=MAX_EXPANDED)
             if candidate['size']!=expanded_size:
                 raise UpdateError('Candidate expanded size changed since preflight')
@@ -329,7 +396,7 @@ class RecoveryStore:
             durable_json(self.backups/(transaction+'.json'),backup); self.fault('prepare-backup-receipt')
             journal={'schema':JOURNAL_SCHEMA,'transaction_id':transaction,'target_path':str(self.target),
                      'boot_id':boot_id,'phase':'prepared','old':old['identity']|{'sha256':old['sha256']},
-                     'expected':manifest,'backup':backup,'credential_generation':credential_generation}
+                     'expected':manifest,'backup':backup,'credential_generation':credential_generation,'runtime_binding':bindings}
             self.fault('prepare-before-journal')
             durable_json(self.state/'journal.json',journal); self.fault('prepare-after-journal')
             self._reconcile_prepare()
@@ -392,7 +459,7 @@ class RecoveryStore:
         if value.get('schema')!=RECOVERY_SCHEMA or value.get('target_path')!=str(self.target): raise UpdateError('Invalid restoration journal')
         stage,saved=self._recovery_paths(value.get('transaction_id'))
         if value.get('stage_path')!=str(stage) or value.get('saved_path')!=str(saved): raise UpdateError('Invalid restoration paths')
-        if value.get('phase') not in ('staging','prepared','target-saved','backup-published','accepted','rolled-back'): raise UpdateError('Invalid restoration phase')
+        if value.get('phase') not in ('staging','prepared','target-saved','rolling-back','backup-published','accepted','rolled-back'): raise UpdateError('Invalid restoration phase')
         return value
 
     def _matches(self,path,record):
@@ -466,6 +533,9 @@ class RecoveryStore:
         backup=restore['backup']; old=restore['old']
         if backup!=journal['backup'] or old.get('path')!=str(self.target):
             raise UpdateError('Restoration records disagree with transaction authority')
+        if restore['phase']=='rolling-back':
+            self._rollback(restore)
+            self._phase(restore,'prepared')
         if restore['phase']=='staging':
             self._matches(self.target,old)
             if saved.exists() or saved.is_symlink(): raise UpdateError('Unexpected saved target before restoration')
@@ -513,8 +583,8 @@ class RecoveryStore:
                 try: os.rename(stage,self.target)
                 except OSError:
                     if not self.target.exists():
-                        os.rename(saved,self.target); sync_dir(self.target.parent)
-                        self._phase(restore,'rolled-back')
+                        self._phase(restore,'rolling-back')
+                        self._rollback(restore)
                     raise UpdateError('Restore failed; the prior target and verified backup were preserved') from None
                 sync_dir(self.target.parent); self.fault('after-backup-rename')
             self._phase(restore,'backup-published')
@@ -543,15 +613,32 @@ class RecoveryStore:
                     'message':'Previous version restored. Open Machine Monitor when you are ready.'}
         raise UpdateError('Restoration was rolled back; verified backup retained')
 
+    def _rollback(self,restore):
+        stage,saved=self._recovery_paths(restore['transaction_id'])
+        if stage.is_symlink() or not stage.is_dir() or stage.stat().st_uid!=os.getuid() or stage.stat().st_ino!=restore.get('stage_inode'):
+            raise UpdateError('Rollback staging identity changed')
+        self._matches(stage,restore['backup'])
+        if saved.exists() or saved.is_symlink():
+            self._matches(saved,restore['old'])
+            if self.target.exists() or self.target.is_symlink(): raise UpdateError('Ambiguous rollback target')
+            os.rename(saved,self.target); sync_dir(self.target.parent)
+            self.fault('after-rollback-rename')
+        else:
+            self._matches(self.target,restore['old'])
+        self._phase(restore,'rolled-back')
+
 
 def main(stdin=None,stdout=None):
     stdin=stdin or sys.stdin; stdout=stdout or sys.stdout
     try:
         request=read_request(stdin)
-        allowed={'action','target_path','manifest','transaction_id','credential_generation','candidate_path','expanded_size'}
+        allowed={'action','target_path','manifest','transaction_id','credential_generation','candidate_path','expanded_size','operation_lock_fd'}
         if set(request)-allowed or request.get('action') not in ('status','prepare','restore','discard'):
             raise UpdateError('Invalid recovery request')
-        store=RecoveryStore(request.get('target_path'))
+        inherited=request.get('operation_lock_fd')
+        if inherited is not None and (type(inherited) is not int or inherited!=3 or request['action']!='prepare'):
+            raise UpdateError('Inherited operation ownership is only valid for native preparation')
+        store=RecoveryStore(request.get('target_path'),inherited_lock_fd=inherited)
         action=request['action']
         if action=='prepare': result=store.prepare(request.get('manifest'),request.get('credential_generation',0),request.get('transaction_id'),candidate_path=request.get('candidate_path'),expanded_size=request.get('expanded_size'))
         elif action=='restore': result=store.restore(request.get('transaction_id'))

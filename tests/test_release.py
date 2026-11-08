@@ -10,6 +10,8 @@ from pathlib import Path
 import plistlib
 import shutil
 import subprocess
+import sys
+import time
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -131,7 +133,7 @@ class ArtifactTests(unittest.TestCase):
     def test_launcher_refuses_modified_helpers(self):
         launcher, source = self.root / 'launcher', self.root / 'source'
         names = ('scripts/release.py', 'scripts/sparkle.py', 'scripts/toolchain.py',
-                 'build_mac_app.py', 'update_contract.py', 'update_preflight.py')
+                 'scripts/processes.py','build_mac_app.py', 'update_contract.py', 'update_preflight.py')
         for root in (launcher, source):
             for name in names:
                 path = root / name
@@ -213,6 +215,9 @@ class ArtifactTests(unittest.TestCase):
         for absent in (r.TEAM, 'runtime', 'Timestamp=Jan 1', 'Authority=Developer ID Application:'):
             with self.assertRaises(r.ReleaseError):
                 r.display_code(self.app, lambda *a, **k: good.replace(absent, '').encode())
+        for flags in ('flags=0x0(none)','flags=0x0(runtime)','flags=0x10000(none)','flags=runtime'):
+            bad='Executable=/private/tmp/runtime/Machine Monitor\n'+good.replace('flags=0x10000(runtime)',flags)
+            with self.assertRaises(r.ReleaseError):r.display_code(self.app,lambda *a,**k:bad.encode())
 
     def test_notary_rejection_never_staples(self):
         for status in ('Invalid', 'In Progress', 'Rejected', None):
@@ -349,7 +354,7 @@ class ArtifactTests(unittest.TestCase):
                 return b'cmd LC_BUILD_VERSION\ncmdsize 32\nplatform 1\nminos 26.0\nsdk 26.0'
             if 'lipo' in args[0]: return b'arm64'
             if '-c' in args:
-                return f'TeamIdentifier={r.TEAM}\nAuthority=Developer ID Application: Fixture\nflags=runtime\nTimestamp=fixture\n'.encode()
+                return f'TeamIdentifier={r.TEAM}\nAuthority=Developer ID Application: Fixture\nflags=0x10000(runtime)\nTimestamp=fixture\n'.encode()
             if 'notarytool' in args:
                 with zipfile.ZipFile(args[3]) as archive:
                     uploaded.append(archive.namelist())
@@ -401,6 +406,32 @@ class ArtifactTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as result, patch('sys.stderr'):
             r.main(['--assume-qualified'])
         self.assertEqual(result.exception.code, 2)
+
+
+class CommandTests(unittest.TestCase):
+    def test_captured_input_and_binary_output(self):
+        self.assertEqual(r.command([sys.executable,'-c','import sys;sys.stdout.buffer.write(sys.stdin.buffer.read());sys.stderr.write("private")'],input=b'bounded\x00bytes'),b'bounded\x00bytes')
+
+    def test_overflow_stops_child_before_later_side_effect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker=Path(directory)/'continued'
+            for stream in ('stdout','stderr'):
+                script='import sys,time;from pathlib import Path;sys.'+stream+'.buffer.write(b"x"*(9*1024**2));sys.'+stream+'.flush();time.sleep(2);Path(sys.argv[1]).write_text("continued")'
+                with self.subTest(stream=stream),self.assertRaisesRegex(r.ReleaseError,'output exceeded'):
+                    r.command([sys.executable,'-c',script,str(marker)],timeout=10)
+                self.assertFalse(marker.exists())
+
+    def test_timeout_stops_nested_builder_group_and_bounds_pipe_drain(self):
+        from scripts.processes import group_stopped
+        with tempfile.TemporaryDirectory() as directory:
+            identity=Path(directory)/'identity.json'
+            leaf='import os,sys,time,json;from pathlib import Path;Path(sys.argv[1]).write_text(json.dumps([os.getpid(),os.getpgrp()]));time.sleep(30)'
+            builder='import os,sys;assert os.environ["MONITOR_OWNED_SHARD_GROUP"]=="1";from scripts.processes import run_build;run_build([sys.executable,"-c",sys.argv[1],sys.argv[2]],timeout=60)'
+            started=time.monotonic()
+            with self.assertRaisesRegex(r.ReleaseError,'timed out'):
+                r.command([sys.executable,'-c',builder,leaf,str(identity)],cwd=r.ROOT,timeout=1)
+            self.assertLess(time.monotonic()-started,10)
+            pid,pgid=json.loads(identity.read_text());self.assertTrue(group_stopped(pgid))
 
 
 if __name__ == '__main__':

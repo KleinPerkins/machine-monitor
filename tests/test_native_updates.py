@@ -30,6 +30,10 @@ class NativeUpdateTests(unittest.TestCase):
             match = re.search(r"NATIVE_UPDATE_FIXTURES (\d+)", result.stdout)
             self.assertIsNotNone(match, result.stdout + result.stderr)
             self.assertGreaterEqual(int(match.group(1)), 45)
+            closed = subprocess.run([str(binary), "--closed-stderr-lock-probe", str(output / 'closed-stderr')],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
+            self.assertIn("NATIVE_CLOSED_STDERR_LOCK passed", closed.stdout)
 
     def test_stock_sparkle_effective_flags(self):
         framework = Path(os.environ["MONITOR_SPARKLE_FRAMEWORK_DIR"])

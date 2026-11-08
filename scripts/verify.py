@@ -28,7 +28,7 @@ def run_suite(files):
 
 
 def execute(identity, files, output):
-    if identity in ('service', 'browser-layout', 'browser-lifecycle'):
+    if identity in ('service', 'browser-layout', 'browser-lifecycle', 'native-app'):
         from scripts.toolchain import node
         os.environ['MONITOR_NODE'] = str(node())
     if identity == 'governance':

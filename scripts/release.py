@@ -17,6 +17,7 @@ from pathlib import Path
 import platform
 import plistlib
 import re
+import selectors
 import shutil
 import signal
 import stat
@@ -52,23 +53,74 @@ def require(condition, message):
 
 def command(args, *, cwd=None, input=None, timeout=60):
     # Suppress raw diagnostics, including from dependencies and Keychain tools.
-    environment = dict(os.environ, GIT_TERMINAL_PROMPT='0', PYTHONDONTWRITEBYTECODE='1')
+    environment = dict(os.environ, GIT_TERMINAL_PROMPT='0', PYTHONDONTWRITEBYTECODE='1',
+                       MONITOR_OWNED_SHARD_GROUP='1')
+    process = None
+    selector = selectors.DefaultSelector()
+    previous = signal.getsignal(signal.SIGTERM)
+    def terminated(signum, frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, terminated)
     try:
-        with subprocess.Popen([str(a) for a in args], cwd=cwd, env=environment,
-                              stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              start_new_session=True) as process:
-            try:
-                out, err = process.communicate(input, timeout=timeout)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.communicate()
-                raise ReleaseError('Release operation timed out; no qualification was issued.') from None
-            require(process.returncode == 0, 'Release operation failed; inspect owner prerequisites privately.')
-            require(len(out) <= 8 * 1024**2 and len(err) <= 8 * 1024**2, 'Release output exceeded its bound.')
-            return out
+        process = subprocess.Popen([str(a) for a in args], cwd=cwd, env=environment,
+            stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        output = {name:bytearray() for name in ('stdout','stderr')}
+        for name in output:
+            stream=getattr(process,name);os.set_blocking(stream.fileno(),False)
+            selector.register(stream,selectors.EVENT_READ,name)
+        pending=memoryview(input or b'')
+        if process.stdin:
+            if pending:
+                os.set_blocking(process.stdin.fileno(),False)
+                selector.register(process.stdin,selectors.EVENT_WRITE,'stdin')
+            else:process.stdin.close()
+        deadline=time.monotonic()+timeout
+        while selector.get_map():
+            remaining=deadline-time.monotonic()
+            require(remaining>0,'Release operation timed out; no qualification was issued.')
+            for key,_ in selector.select(min(remaining,.1)):
+                stream=key.fileobj
+                if key.data=='stdin':
+                    try:pending=pending[os.write(stream.fileno(),pending[:65536]):]
+                    except BrokenPipeError:pending=pending[:0]
+                    if not pending:selector.unregister(stream);stream.close()
+                else:
+                    chunk=os.read(stream.fileno(),65536)
+                    if not chunk:selector.unregister(stream);stream.close();continue
+                    require(len(output[key.data])+len(chunk)<=8*1024**2,'Release output exceeded its bound.')
+                    output[key.data].extend(chunk)
+        try:process.wait(timeout=max(.001,deadline-time.monotonic()))
+        except subprocess.TimeoutExpired:raise ReleaseError('Release operation timed out; no qualification was issued.') from None
+        require(process.returncode == 0,'Release operation failed; inspect owner prerequisites privately.')
+        return bytes(output['stdout'])
     except OSError:
         raise ReleaseError('Required release tool is unavailable.') from None
+    finally:
+        # Build helpers inherit this owned group, including their nested tools.
+        # Never communicate() without a deadline after cancellation or overflow.
+        deferred=[]
+        def defer(signum,frame):deferred.append(signum)
+        handlers={sig:signal.getsignal(sig) for sig in (signal.SIGINT,signal.SIGTERM)}
+        for sig in handlers:signal.signal(sig,defer)
+        try:
+            if process is not None:
+                from scripts.processes import send_group,group_stopped
+                send_group(process.pid,signal.SIGTERM)
+                try:process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    send_group(process.pid,signal.SIGKILL);process.wait(timeout=5)
+                send_group(process.pid,signal.SIGKILL)
+                cleanup_deadline=time.monotonic()+3
+                while not group_stopped(process.pid) and time.monotonic()<cleanup_deadline:time.sleep(.05)
+                require(group_stopped(process.pid),'Release child cleanup could not be verified.')
+                for stream in (process.stdin,process.stdout,process.stderr):
+                    if stream and not stream.closed:stream.close()
+        finally:
+            selector.close()
+            for sig,handler in handlers.items():signal.signal(sig,handler)
+            signal.signal(signal.SIGTERM,previous)
+        if deferred:raise SystemExit(128+deferred[0])
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -206,7 +258,7 @@ def fetch_source(sha, target, run=command):
 def verify_launcher(source):
     # The isolated builder must not be qualified by modified or stale helper code
     # imported from the invoking checkout. Unrelated local files never enter it.
-    for name in ('scripts/release.py', 'scripts/sparkle.py', 'scripts/toolchain.py',
+    for name in ('scripts/release.py', 'scripts/sparkle.py', 'scripts/toolchain.py','scripts/processes.py',
                  'build_mac_app.py', 'update_contract.py', 'update_preflight.py'):
         require((ROOT / name).read_bytes() == (source / name).read_bytes(),
                 'Invoke release tooling whose helpers match the exact merged source.')
@@ -274,8 +326,9 @@ def display_code(target, run):
     bridge = ('import subprocess,sys; p=subprocess.run(sys.argv[1:],capture_output=True); '
               'sys.stdout.buffer.write(p.stderr); sys.exit(p.returncode)')
     output = run([sys.executable, '-c', bridge, '/usr/bin/codesign', '-d', '--verbose=4', str(target)]).decode()
+    flags=re.search(r'(?:^|\s)flags=0x([0-9a-fA-F]+)\(([^)\n]*)\)',output)
     require('TeamIdentifier=' + TEAM in output and 'Authority=Developer ID Application:' in output
-            and 'runtime' in output and re.search(r'^Timestamp=.+', output, re.M),
+            and flags and int(flags[1],16)&0x10000 and 'runtime' in flags[2].split(',') and re.search(r'^Timestamp=.+', output, re.M),
             'Nested code lacks Developer ID, hardened runtime, or secure timestamp.')
 
 

@@ -92,7 +92,9 @@ Renew it only from a new actual observation. No actual owner account, URL,
 observation, access file or artifact is included in this repository.
 
 Wrangler must be preinstalled at exactly **4.158.0**, and Node at **26.4.0**
-(`MONITOR_NODE` can select the executable). The original owner HOME/auth context
+(`MONITOR_NODE` can select the executable). Configure the absolute JavaScript
+entry point, `wrangler/bin/wrangler.js`; the tool executes it through the verified
+Node binary, regardless of the interpreter selected by `PATH`. The original owner HOME/auth context
 is retained. `wrangler auth token --json` output is captured only in process
 memory; no token enters argv/config/logs/recipient apps. OAuth/API-token auth is
 supported; global key/email auth is refused. Wrangler's normal `log` level is
@@ -182,6 +184,30 @@ override/route behavior, plus actual signed older-to-newer upgrades. Synthetic
 fixtures prove source behavior only and create no provider resources.
 
 ## Synthetic validation
+
+`scripts/release.py` prepares artifacts locally from the exact current merged
+`main` after its latest GitHub Actions `ci-required` passes. Run it in the pinned
+Python/development/build environment, with an existing mode-0700 output directory
+outside Git and explicit arguments:
+
+```sh
+python scripts/release.py --source-revision MERGED_MAIN_SHA \
+  --version VERSION --build-number BUILD --release-id RELEASE_ID \
+  --qualification-id QUALIFICATION_ID --update-config /private/public-settings.json \
+  --signing-identity CERTIFICATE_SHA --notary-profile PROFILE_NAME \
+  --sparkle-account APP_SPECIFIC_ACCOUNT --output /private/releases
+```
+
+The settings file contains only `origin`, `channel` and `public_ed25519_key`.
+Signing identity, notary profile and Sparkle account are references to existing
+owner-managed secure material. The tool never exports keys. It builds an isolated
+checkout, signs inside-out, requires accepted notarization and validated stapling,
+checks Gatekeeper and packages the final bytes. Outputs include a main-only
+updater archive, a separate first-install package with Recovery and instructions,
+manifest, qualification receipt and provenance. Child output, deadlines and
+process groups are bounded. Output always remains unqualified on the owner-only
+qualification channel; a real private upgrade and exact-byte stable promotion
+remain separate steps. This command performs no deployment or installation.
 
 `tests/test_update_channel.py` runs the actual Worker against Node's in-memory
 SQLite and fixture Static Assets (not a rewritten authorization model), plus owner-tool

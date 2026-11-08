@@ -38,6 +38,28 @@ private final class FixtureProtocol: URLProtocol {
 
 @main struct UpdateFixtures {
     static func main() throws {
+        if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "--update-recovery" {
+            let request = try JSONSerialization.jsonObject(with: FileHandle.standardInput.readDataToEndOfFile()) as! [String: Any]
+            let path = request["fixture_lock_path"] as! String
+            var inherited = stat(), canonical = stat()
+            guard fstat(3, &inherited) == 0, lstat(path, &canonical) == 0,
+                  inherited.st_dev == canonical.st_dev, inherited.st_ino == canonical.st_ino,
+                  inherited.st_mode & S_IFMT == S_IFREG, inherited.st_uid == getuid(),
+                  inherited.st_mode & 0o777 == 0o600, inherited.st_nlink == 1 else { exit(3) }
+            let retained = fcntl(3, F_DUPFD_CLOEXEC, 4)
+            guard retained >= 4, flock(retained, LOCK_EX | LOCK_NB) == 0 else { exit(4) }
+            close(3)
+            if request["hold"] as? Bool == true { usleep(10_000_000) }
+            close(retained)
+            print("{\"ok\":true,\"lock_validated\":true}")
+            return
+        }
+        if CommandLine.arguments.count > 2 && CommandLine.arguments[1] == "--closed-stderr-lock-probe" {
+            close(STDERR_FILENO)
+            try lockTransportFixtures(base: URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true))
+            print("NATIVE_CLOSED_STDERR_LOCK passed")
+            return
+        }
         let base = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true).resolvingSymlinksInPath()
         let key = Curve25519.Signing.PrivateKey()
         let payload = Data(repeating: 0x5a, count: 180_001)
@@ -53,6 +75,29 @@ private final class FixtureProtocol: URLProtocol {
             "first_install": ["path": "/v1/apps/com.kleinperkins.machine-monitor/releases/fixture/package", "size": payload.count, "sha256": digest, "ed25519_signature": signature]]
         func parse() throws -> UpdateManifest { try UpdateManifest.parse(JSONSerialization.data(withJSONObject: object), configuration: config) }
         let manifest = try parse()
+        let admission = try UpdateRuntimeBinding.parse(["origin": origin.absoluteString, "channel": "qualification",
+            "public_ed25519_key": key.publicKey.rawRepresentation.base64EncodedString(), "source_revision": String(repeating: "b", count: 40)])
+        let target = try UpdateRuntimeBinding.parse(admission.dictionary.merging(["channel": "stable", "source_revision": manifest.source_revision]) { _, new in new })
+        let bindingObject: [String: Any] = ["schema": "machine-monitor/runtime-bindings/v1", "admission": admission.dictionary, "target": target.dictionary]
+        let bindings = try UpdateRuntimeBindings.parse(bindingObject)
+        var qualifiedObject = object; qualifiedObject["channel"] = "qualification"; qualifiedObject["qualified"] = false
+        let qualification = try UpdateManifest.parse(JSONSerialization.data(withJSONObject: qualifiedObject), configuration: bindings.admissionConfiguration(config))
+        try bindings.validate(current: target, build: 2, oldBuild: 1, manifest: qualification)
+        try bindings.validate(current: admission, build: 1, oldBuild: 1, manifest: qualification)
+        try bindings.validate(current: target, build: 2, oldBuild: 1, manifest: qualification)
+        try refuses("unrecorded runtime source") {
+            let changed = try UpdateRuntimeBinding.parse(target.dictionary.merging(["source_revision": String(repeating: "c", count: 40)]) { _, new in new })
+            try bindings.validate(current: changed, build: 2, oldBuild: 1, manifest: qualification)
+        }
+        for override in [["origin": "https://elsewhere.invalid"], ["public_ed25519_key": Data(repeating: 9, count: 32).base64EncodedString()]] {
+            try refuses("runtime origin or publisher rotation") {
+                _ = try UpdateRuntimeBindings.parse(["schema": "machine-monitor/runtime-bindings/v1", "admission": admission.dictionary,
+                    "target": target.dictionary.merging(override) { _, new in new }])
+            }
+        }
+        try refuses("stable to qualification runtime") {
+            _ = try UpdateRuntimeBindings.parse(["schema": "machine-monitor/runtime-bindings/v1", "admission": target.dictionary, "target": admission.dictionary])
+        }
         try refuses("duplicate root JSON key") { _ = try UpdateJSON.object(Data("{\"a\":1,\"a\":2}".utf8)) }
         try refuses("escaped duplicate nested key") { _ = try UpdateJSON.object(Data(#"{"outer":{"a":1,"\u0061":2}}"#.utf8)) }
         object["unexpected"] = true; try refuses("manifest extra field") { _ = try parse() }; object.removeValue(forKey: "unexpected")
@@ -146,6 +191,8 @@ private final class FixtureProtocol: URLProtocol {
         print("NATIVE_UPDATE_FIXTURES " + String(assertions))
     }
     private static func stateFixtures(base: URL, manifest: UpdateManifest) throws {
+        try lockTransportFixtures(base: base.appendingPathComponent("helper-lock"))
+        try crossBootFixtures(base: base.appendingPathComponent("cross-boot"), manifest: manifest)
         let target = base.appendingPathComponent("Fixture.app")
         let stateBase = base.appendingPathComponent("state")
         let state = try UpdateOperationState(target: target, base: stateBase, bootID: "fixture-boot")
@@ -195,5 +242,71 @@ private final class FixtureProtocol: URLProtocol {
         try state.markActualRelaunch(now: Date().addingTimeInterval(-700))
         try refuses("stale marker") { _ = try state.reconcile(build: 2, verify: { _ in }) }
         state.unlock(); try contender.acquire(); contender.unlock()
+    }
+    private static func lockTransportFixtures(base: URL) throws {
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let state = try UpdateOperationState(target: base.appendingPathComponent("Fixture.app"), base: base.appendingPathComponent("state"), bootID: "fixture-boot")
+        try state.acquire()
+        let contender = try UpdateOperationState(target: state.target, base: base.appendingPathComponent("state"), bootID: "fixture-boot")
+        let helper = UpdateHelper()
+        let binary = URL(fileURLWithPath: CommandLine.arguments[0])
+        let payload: [String: Any] = ["action": "prepare", "operation_lock_fd": 3,
+            "fixture_lock_path": state.directory.appendingPathComponent("operation.lock").path]
+        try refuses("recovery before helper launch") { try contender.acquire() }
+        let result: Result<[String: Any], Error> = try awaitValue { done in
+            helper.run(executable: binary, mode: "--update-recovery", payload: payload,
+                       operationLock: try! state.preparationLock(), completion: done)
+        }
+        try check(try result.get()["lock_validated"] as? Bool == true, "helper inherited exact operation lock")
+        try refuses("recovery after helper termination") { try contender.acquire() }
+        var heldPayload = payload; heldPayload["hold"] = true
+        let cancelled: Result<[String: Any], Error> = try awaitValue { done in
+            helper.run(executable: binary, mode: "--update-recovery", payload: heldPayload,
+                       operationLock: try! state.preparationLock(), completion: done)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { helper.cancel() }
+        }
+        if case .success = cancelled { throw UpdateFailure.invalid("cancelled helper succeeded") }
+        try refuses("recovery after cancellation reaping") { try contender.acquire() }
+        try check(try Data(contentsOf: state.directory.appendingPathComponent("operation.lock")).isEmpty, "lock contents unchanged")
+        state.unlock(); try contender.acquire(); contender.unlock()
+    }
+    private static func crossBootFixtures(base: URL, manifest: UpdateManifest) throws {
+        let oldBoot = "00000000-0000-4000-8000-000000000001", newBoot = "00000000-0000-4000-8000-000000000002"
+        func setup(_ name: String, phase: String = "installer-pending", boot: String? = nil) throws -> UpdateOperationState {
+            let directory = base.appendingPathComponent(name)
+            let state = try UpdateOperationState(target: directory.appendingPathComponent("Fixture.app"), base: directory.appendingPathComponent("state"), bootID: newBoot)
+            try state.acquire()
+            let identity: [String: Any] = ["build": 1, "version": "1.0", "bundle_id": UpdateConfiguration.appID, "team_id": UpdateConfiguration.teamID, "data_schema_version": 1]
+            let hash = String(repeating: "b", count: 64), transaction = String(repeating: "c", count: 32)
+            var old = identity; old["sha256"] = hash
+            try state.write("journal.json", ["schema": "machine-monitor/update-journal/v1", "transaction_id": transaction,
+                "target_path": state.target.path, "boot_id": boot ?? oldBoot, "phase": phase, "old": old,
+                "expected": manifest.dictionary, "credential_generation": 0,
+                "backup": ["path": state.directory.appendingPathComponent("backups/" + transaction + ".app").path,
+                    "identity": identity, "sha256": hash, "size": 100]])
+            return state
+        }
+        let valid = try setup("valid")
+        try check(try valid.reconcile(build: 2, verify: { try check($0 == 2, "cross-boot verifies expected build") }) == .ordinary && valid.needsAcceptance,
+                  "verified explicit next-open adoption after reboot")
+        try check(try valid.read("boot-adoption.json") != nil, "durable cross-boot intent precedes startup")
+        try valid.acceptReadiness(build: 2)
+        try check(try valid.read("boot-adoption.json") == nil, "accepted cross-boot intent resolved")
+        try check(try valid.reconcile(build: 2, verify: { _ in }) == .ordinary, "subsequent accepted launch")
+        valid.unlock()
+        let interrupted = try setup("interrupted")
+        _ = try interrupted.reconcile(build: 2, verify: { _ in }); interrupted.unlock()
+        let restarted = try UpdateOperationState(target: interrupted.target, base: base.appendingPathComponent("interrupted/state"), bootID: newBoot)
+        try refuses("interrupted cross-boot readiness") { _ = try restarted.reconcile(build: 2, verify: { _ in }) }; restarted.unlock()
+        for name in ["marker", "preparation", "intent", "unverified", "wrong-build", "malformed-boot", "already-observed"] {
+            let state = try setup(name, phase: name == "already-observed" ? "replacement-observed" : "installer-pending", boot: name == "malformed-boot" ? "invalid" : nil)
+            if name == "marker" { try state.write("relaunch.json", ["unknown": true]) }
+            if name == "preparation" { try state.write("preparation.json", ["unknown": true]) }
+            if name == "intent" { try state.write("boot-adoption.json", ["unknown": true]) }
+            try refuses("unsafe cross-boot " + name) {
+                _ = try state.reconcile(build: name == "wrong-build" ? 1 : 2, verify: { _ in if name == "unverified" { throw UpdateFailure.recovery } })
+            }
+            state.unlock()
+        }
     }
 }

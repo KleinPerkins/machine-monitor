@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import json
+import plistlib
 from pathlib import Path
 import stat
 import zipfile
@@ -25,6 +26,10 @@ def app(path,build=1):
     (path/'Contents').mkdir()
     (path/'Contents/fixture.json').write_text(json.dumps(identity(build),sort_keys=True))
     (path/'Contents/executable').write_bytes(b'Synthetic inert application '+str(build).encode())
+    (path/'Contents/Info.plist').write_bytes(plistlib.dumps(dict(
+        MachineMonitorUpdateOrigin='https://updates.invalid',MachineMonitorUpdateChannel='stable',
+        SUPublicEDKey=base64.b64encode(bytes(32)).decode(),MachineMonitorSourceRevision='a'*40,
+        SUEnableAutomaticChecks=False,SUAllowsAutomaticUpdates=True,SUAutomaticallyUpdate=True,SUVerifyUpdateBeforeExtraction=True)))
     return path
 
 

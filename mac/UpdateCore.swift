@@ -38,6 +38,8 @@ struct UpdateConfiguration {
               let buildText = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
               let build = Int(buildText), build > 0,
               let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+              let revision = bundle.object(forInfoDictionaryKey: "MachineMonitorSourceRevision") as? String,
+              revision.range(of: "^[0-9a-f]{40}$", options: .regularExpression) != nil,
               bundle.object(forInfoDictionaryKey: "SUEnableAutomaticChecks") as? Bool == false,
               bundle.object(forInfoDictionaryKey: "SUAllowsAutomaticUpdates") as? Bool == true,
               bundle.object(forInfoDictionaryKey: "SUAutomaticallyUpdate") as? Bool == true,
@@ -46,6 +48,11 @@ struct UpdateConfiguration {
         else { return nil }
         return UpdateConfiguration(origin: origin, publicKey: key, channel: channel,
                                    currentBuild: build, version: version, bundle: bundle)
+    }
+    func runtimeBinding() throws -> UpdateRuntimeBinding {
+        guard let source = bundle.object(forInfoDictionaryKey: "MachineMonitorSourceRevision") as? String else { throw UpdateFailure.recovery }
+        return try UpdateRuntimeBinding.parse(["origin": origin.absoluteString, "channel": channel,
+            "public_ed25519_key": publicKey.base64EncodedString(), "source_revision": source])
     }
     static func validOrigin(_ url: URL) -> Bool {
         url.scheme == "https" && url.host != nil && url.user == nil && url.password == nil &&
@@ -58,6 +65,47 @@ struct UpdateConfiguration {
               url.scheme == origin.scheme, url.host == origin.host, url.port == origin.port
         else { throw UpdateFailure.invalid("unapproved address") }
         return url
+    }
+}
+
+struct UpdateRuntimeBinding: Equatable {
+    let origin: String
+    let channel: String
+    let publicKey: String
+    let source: String
+    static func parse(_ value: Any?) throws -> UpdateRuntimeBinding {
+        guard let value = value as? [String: Any], Set(value.keys) == Set(["origin", "channel", "public_ed25519_key", "source_revision"]),
+              let origin = value["origin"] as? String, let url = URL(string: origin), UpdateConfiguration.validOrigin(url),
+              url.absoluteString == origin, url.port == nil,
+              let channel = value["channel"] as? String, ["stable", "qualification"].contains(channel),
+              let key = value["public_ed25519_key"] as? String, let bytes = Data(base64Encoded: key), bytes.count == 32, bytes.base64EncodedString() == key,
+              let source = value["source_revision"] as? String, source.range(of: "^[0-9a-f]{40}$", options: .regularExpression) != nil
+        else { throw UpdateFailure.recovery }
+        return UpdateRuntimeBinding(origin: origin, channel: channel, publicKey: key, source: source)
+    }
+    var dictionary: [String: String] { ["origin": origin, "channel": channel, "public_ed25519_key": publicKey, "source_revision": source] }
+}
+
+struct UpdateRuntimeBindings {
+    let admission: UpdateRuntimeBinding
+    let target: UpdateRuntimeBinding
+    static func parse(_ value: Any?) throws -> UpdateRuntimeBindings {
+        guard let value = value as? [String: Any], Set(value.keys) == Set(["schema", "admission", "target"]),
+              value["schema"] as? String == "machine-monitor/runtime-bindings/v1" else { throw UpdateFailure.recovery }
+        let old = try UpdateRuntimeBinding.parse(value["admission"]), new = try UpdateRuntimeBinding.parse(value["target"])
+        guard old.origin == new.origin, old.publicKey == new.publicKey,
+              (old.channel == "qualification" && ["qualification", "stable"].contains(new.channel)) || (old.channel == "stable" && new.channel == "stable")
+        else { throw UpdateFailure.recovery }
+        return UpdateRuntimeBindings(admission: old, target: new)
+    }
+    func admissionConfiguration(_ current: UpdateConfiguration) -> UpdateConfiguration {
+        UpdateConfiguration(origin: URL(string: admission.origin)!, publicKey: Data(base64Encoded: admission.publicKey)!,
+            channel: admission.channel, currentBuild: current.currentBuild, version: current.version, bundle: current.bundle)
+    }
+    func validate(current: UpdateRuntimeBinding, build: Int, oldBuild: Int, manifest: UpdateManifest) throws {
+        guard manifest.channel == admission.channel, manifest.source_revision == target.source,
+              (build == manifest.build && current == target) || (build == oldBuild && current == admission)
+        else { throw UpdateFailure.recovery }
     }
 }
 

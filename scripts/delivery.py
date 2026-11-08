@@ -218,7 +218,9 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 class Cloudflare:
     def __init__(self, config):
         self.config = config
-        pinned_node()
+        self.node = pinned_node()
+        if not Path(config['wrangler']).is_absolute() or not config['wrangler'].endswith('.js'):
+            raise DeliveryError('Select the pinned Wrangler JavaScript entry point with an absolute path.')
         # Keep HOME/auth unchanged. Never run login or activate a plan here.
         version = self.wrangler('--version').strip()
         if version != WRANGLER:
@@ -260,7 +262,7 @@ class Cloudflare:
         if self.config.get('account_id'):
             environment['CLOUDFLARE_ACCOUNT_ID'] = self.config['account_id']
         try:
-            result = subprocess.run([self.config['wrangler'], *args], stdin=subprocess.DEVNULL,
+            result = subprocess.run([self.node, self.config['wrangler'], *args], stdin=subprocess.DEVNULL,
                                     capture_output=True, env=environment, cwd=ROOT, timeout=timeout)
         except (OSError, subprocess.TimeoutExpired):
             raise DeliveryError('Pinned Wrangler operation failed or timed out.') from None
@@ -491,10 +493,14 @@ def audit_deployment(api, require_current_source=True):
         raise DeliveryError('Default/preview route configuration is unsafe or unknown.')
     # The supported workers.dev-only profile cannot have custom routes/domains.
     domains = api.api('/workers/domains')
-    if not isinstance(domains, list) or any(d.get('service') == config['worker_name'] for d in domains):
+    if not isinstance(domains, list) or any(not isinstance(d, dict) or
+            not isinstance(d.get('service'), str) or not d['service'] or
+            d['service'] == config['worker_name'] for d in domains):
         raise DeliveryError('Custom routes/domains require separately qualified fail-closed routing.')
     routes = api.zone_routes()
-    if not isinstance(routes, list) or any(r.get('script') == config['worker_name'] for r in routes):
+    if not isinstance(routes, list) or any(not isinstance(r, dict) or 'script' not in r or
+            (r['script'] is not None and (not isinstance(r['script'], str) or not r['script'])) or
+            r['script'] == config['worker_name'] for r in routes):
         raise DeliveryError('Any custom zone route requires separately qualified fail-closed routing.')
     return state
 

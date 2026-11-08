@@ -316,6 +316,14 @@ class ChannelTests(unittest.TestCase):
             changed = dict(responses, **{path: bad})
             with patch.object(api, 'zone_routes', return_value=[]), patch.object(api,'api',side_effect=lambda key: changed[key]), self.assertRaises(delivery.DeliveryError):
                 delivery.audit_deployment(api)
+        for domains, routes in (([{'unknown_shape':'monitor'}],[]),([], [{'unknown_shape':'monitor','fail_open':True}]),
+                                 ([None],[]),([{'service':False}],[]),([], [{'script':[]}]),([], [{'script':''}])):
+            changed = dict(responses, **{'/workers/domains':domains})
+            with patch.object(api, 'zone_routes', return_value=routes), patch.object(api,'api',side_effect=lambda key: changed[key]), self.assertRaises(delivery.DeliveryError):
+                delivery.audit_deployment(api)
+        changed = dict(responses, **{'/workers/domains':[{'service':'other-worker'}]})
+        with patch.object(api, 'zone_routes', return_value=[{'script':None},{'script':'other-worker'}]), patch.object(api,'api',side_effect=lambda key: changed[key]):
+            delivery.audit_deployment(api)
 
     def test_existing_worker_with_lost_receipt_cannot_be_replaced(self):
         api = delivery.Cloudflare.__new__(delivery.Cloudflare);api.config=self.api.config
@@ -378,9 +386,10 @@ class ChannelTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, b'4.158.0\n', b'')
             return subprocess.CompletedProcess(args, 0, json.dumps({'type': 'oauth', 'token': secret}).encode(), b'')
         with patch.object(delivery, 'pinned_node', return_value='/fixture/node'), patch.object(delivery.subprocess, 'run', side_effect=fake):
-            api = delivery.Cloudflare({'wrangler': '/fixture/wrangler'})
+            api = delivery.Cloudflare({'wrangler': '/fixture/wrangler.js'})
         self.assertEqual(api._authorization, 'Bearer ' + secret)
         for args, kwargs in seen:
+            self.assertEqual(args[:2], ['/fixture/node', '/fixture/wrangler.js'])
             self.assertNotIn(secret, repr(args))
             self.assertEqual(kwargs['env']['WRANGLER_SEND_METRICS'], 'false')
             self.assertEqual(kwargs['env']['WRANGLER_WRITE_LOGS'], 'false')
@@ -392,7 +401,18 @@ class ChannelTests(unittest.TestCase):
             self.assertNotIn('WRANGLER_OUTPUT_FILE_DIRECTORY', kwargs['env'])
             self.assertEqual(kwargs['stdin'], subprocess.DEVNULL)
         with patch.object(delivery.Cloudflare, 'wrangler', return_value='4.0.0'), self.assertRaises(delivery.DeliveryError):
-            delivery.Cloudflare({'wrangler': '/fixture/wrangler'})
+            delivery.Cloudflare({'wrangler': '/fixture/wrangler.js'})
+
+    def test_wrangler_runs_the_verified_node_despite_conflicting_path(self):
+        root = Path(self.temp.name).resolve() if hasattr(self,'temp') else self.api.root
+        launcher = root/'wrangler.js'
+        launcher.write_text("process.stdout.write(process.argv.includes('--version') ? '4.158.0' : JSON.stringify({type:'oauth',token:'synthetic-token'}))")
+        fake = root/'node'; fake.write_text('#!/bin/sh\nexit 99\n'); fake.chmod(0o700)
+        binary = str(Path(node()).resolve())
+        with patch.dict(os.environ, {'PATH':str(root), 'MONITOR_NODE':binary}):
+            api = delivery.Cloudflare({'wrangler':str(launcher)})
+        self.assertEqual(api.node,binary)
+        self.assertEqual(api._authorization,'Bearer synthetic-token')
 
 
 if __name__ == '__main__':

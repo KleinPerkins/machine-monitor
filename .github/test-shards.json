@@ -86,6 +86,7 @@
       "tests": [
         "test_desktop_service.py",
         "tests/test_native_app.py",
+        "tests/test_release.py",
         "tests/test_update_preflight.py",
         "tests/test_update_recovery.py",
         "tests/test_native_updates.py"

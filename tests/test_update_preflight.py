@@ -142,6 +142,19 @@ class PreflightTests(unittest.TestCase):
             with patch.object(preflight.sys,'platform','darwin'),patch.object(preflight,'run_checked',return_value='arm64'):
                 with self.assertRaises(UpdateError): preflight.verify_identity(app)
 
+    def test_safe_executable_basename_preserves_spaces(self):
+        app=self.root/'app'; (app/'Contents').mkdir(parents=True)
+        info={'CFBundleIdentifier':'com.kleinperkins.machine-monitor','CFBundleExecutable':'Machine Monitor','CFBundleVersion':'2',
+              'CFBundleShortVersionString':'1.2','LSMinimumSystemVersion':'26.0','MachineMonitorDataSchemaVersion':1}
+        path=app/'Contents/Info.plist'; path.write_bytes(plistlib.dumps(info))
+        with patch.object(preflight.sys,'platform','darwin'),patch.object(preflight,'run_checked',return_value='arm64') as calls:
+            self.assertEqual(preflight.verify_identity(app)['build'],2)
+            self.assertEqual(calls.call_args.args[0][-1],str(app/'Contents/MacOS/Machine Monitor'))
+            for name in ('',' ',' Machine Monitor','Machine Monitor ','.','..','../escape','a/b','a\\b','a\n','a\x00','a'*129):
+                with self.subTest(name=name):
+                    path.write_bytes(plistlib.dumps(info|{'CFBundleExecutable':name},fmt=plistlib.FMT_BINARY))
+                    with self.assertRaises(UpdateError): preflight.verify_identity(app)
+
     def test_manifest_and_json(self):
         self.assertEqual(version_tuple('1.10'),(1,10,0,0))
         for key,value in [('build',True),('build',1),('architecture','x86_64'),('team_id','OTHER'),('qualified',False),('data_schema_version',True)]:

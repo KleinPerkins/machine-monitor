@@ -66,9 +66,12 @@ final class UpdateCoordinator: NSObject {
             coordinator.operation = operation
             coordinator.startupDisposition = try operation.reconcile(build: config.currentBuild) { build in
                 let expected = operation.journal?["expected"] as? [String: Any]
-                if let expected { _ = try UpdateManifest.parse(JSONSerialization.data(withJSONObject: expected), configuration: config) }
                 let old = operation.journal?["old"] as? [String: Any]
-                let version = (expected?["build"] as? Int == build ? expected?["version"] : old?["version"]) as? String
+                guard let expected, let oldBuild = old?["build"] as? Int else { throw UpdateFailure.recovery }
+                let bindings = try UpdateRuntimeBindings.parse(operation.journal?["runtime_binding"])
+                let manifest = try UpdateManifest.parse(JSONSerialization.data(withJSONObject: expected), configuration: bindings.admissionConfiguration(config))
+                try bindings.validate(current: config.runtimeBinding(), build: build, oldBuild: oldBuild, manifest: manifest)
+                let version = (expected["build"] as? Int == build ? expected["version"] : old?["version"]) as? String
                 try UpdateCodeVerifier.verify(bundle.bundleURL, expectedBuild: build, expectedVersion: version)
             }
             coordinator.startupReadinessPending = operation.needsAcceptance
@@ -277,13 +280,12 @@ final class UpdateCoordinator: NSObject {
                 }
                 let transaction = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
                 self.transaction = transaction; self.backupPreparationInFlight = true
-                operation.unlock()
+                let preparationLock = try operation.preparationLock()
                 self.helper.run(executable: helperURL, mode: "--update-recovery", payload: ["action": "prepare", "target_path": operation.target.path,
                     "manifest": manifest.dictionary, "transaction_id": transaction, "credential_generation": ticket,
-                    "candidate_path": candidatePath, "expanded_size": candidateExpandedSize]) { [weak self] result in
+                    "candidate_path": candidatePath, "expanded_size": candidateExpandedSize, "operation_lock_fd": 3], operationLock: preparationLock) { [weak self] result in
                     guard let self else { return }
                     self.backupPreparationInFlight = false
-                    do { try operation.acquire() } catch { self.enterRecovery(); return }
                     do {
                         let prepared = try result.get()
                         guard prepared["transaction_id"] as? String == transaction else { self.enterRecovery(); return }

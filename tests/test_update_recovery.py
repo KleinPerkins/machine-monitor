@@ -1,4 +1,7 @@
 import io
+import os
+import fcntl
+import plistlib
 import json
 from pathlib import Path
 import shutil
@@ -239,6 +242,80 @@ class RecoveryTests(unittest.TestCase):
         result=self.store.restore(prepared['transaction_id'])
         self.assertEqual(result['restored']['build'],1)
         self.assertTrue(Path(prepared['backup']['path']).exists())
+
+    def test_rollback_intent_reconciles_both_sides_of_rename(self):
+        for point in ('rolling-back','after-rollback-rename'):
+            with self.subTest(point=point), tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary).resolve(); target=app(root/'Monitor.app')
+                store=recovery.RecoveryStore(target,base=root/'state',verifier=verifier,boot=lambda:'fixture-boot')
+                prepared=self.prepare_store(store)
+                shutil.rmtree(target); app(target,2)
+                def fault(value):
+                    if value==point: raise Crash()
+                store.fault=fault
+                rename=recovery.os.rename
+                def fail_publish(source,destination):
+                    if '.machine-monitor-restore-' in str(source): raise OSError('fixture failure')
+                    return rename(source,destination)
+                with patch.object(recovery.os,'rename',side_effect=fail_publish), self.assertRaises(Crash):
+                    store.restore(prepared['transaction_id'])
+                store.fault=lambda value:None
+                self.assertEqual(store.restore(prepared['transaction_id'])['restored']['build'],1)
+                self.assertTrue(Path(prepared['backup']['path']).exists())
+
+    def test_inherited_prepare_ownership_continuously_excludes_recovery(self):
+        path=self.store.state/'operation.lock'
+        fd=os.open(path,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+        try:
+            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            points=[]
+            def contender(point):
+                points.append(point)
+                with self.assertRaisesRegex(UpdateError,'Quit Machine Monitor'):
+                    self.new().status()
+            inherited=self.new(inherited_lock_fd=os.dup(fd),fault=contender)
+            with self.assertRaisesRegex(UpdateError,'Quit Machine Monitor'): self.new().status()
+            prepared=self.prepare_store(inherited)
+            self.assertGreater(len(points),2)
+            with self.assertRaisesRegex(UpdateError,'Quit Machine Monitor'): self.new().status()
+        finally: os.close(fd)
+        self.assertTrue(self.new().status()['can_restore'])
+        foreign=os.open(self.root/'foreign.lock',os.O_CREAT|os.O_RDWR,0o600)
+        try:
+            with self.assertRaisesRegex(UpdateError,'does not match'):
+                self.new(inherited_lock_fd=os.dup(foreign)).status()
+        finally: os.close(foreign)
+        self.assertEqual(path.read_bytes(),b'')
+
+    def test_qualification_to_stable_runtime_binding_and_restoration(self):
+        path=self.target/'Contents/Info.plist'
+        info=plistlib.loads(path.read_bytes()); info['MachineMonitorUpdateChannel']='qualification'
+        path.write_bytes(plistlib.dumps(info))
+        release=manifest(); release.update(channel='qualification',qualified=False)
+        prepared=self.prepare_store(self.store,release)
+        binding=prepared['journal']['runtime_binding']
+        self.assertEqual(binding['admission']['channel'],'qualification')
+        self.assertEqual(binding['target']['channel'],'stable')
+        self.replace(2)
+        self.assertEqual(self.store.restore(prepared['transaction_id'])['restored']['build'],1)
+        self.assertEqual(plistlib.loads(path.read_bytes())['MachineMonitorUpdateChannel'],'qualification')
+
+    def test_runtime_transition_rejects_reversed_channel_key_origin_and_source(self):
+        cases=[({'MachineMonitorUpdateChannel':'qualification'},{}),
+               ({'MachineMonitorUpdateOrigin':'https://elsewhere.invalid'},{}),
+               ({'SUPublicEDKey':__import__('base64').b64encode(b'x'*32).decode()},{}),
+               ({'MachineMonitorSourceRevision':'b'*40},{}),
+               ({'SUEnableAutomaticChecks':True},{}),
+               ({},{'channel':'qualification','qualified':False})]
+        for updates,release_updates in cases:
+            with self.subTest(updates=updates,release_updates=release_updates), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory).resolve(); target=app(root/'Target.app'); candidate=app(root/'Candidate.app',2)
+                path=candidate/'Contents/Info.plist'; info=plistlib.loads(path.read_bytes()); info.update(updates)
+                path.write_bytes(plistlib.dumps(info)); release=manifest()|release_updates
+                store=recovery.RecoveryStore(target,base=root/'state',verifier=verifier,boot=lambda:'fixture-boot')
+                with self.assertRaises(UpdateError):
+                    store.prepare(release,candidate_path=candidate,expanded_size=recovery.tree_digest(candidate)[1])
+                self.assertFalse((store.state/'original.app').exists())
 
     def test_tampered_backup_journal_path_and_permissions(self):
         prepared=self.prepare()
