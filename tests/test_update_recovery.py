@@ -28,7 +28,14 @@ class RecoveryTests(unittest.TestCase):
     def new(self,**kwargs):
         return recovery.RecoveryStore(self.target,base=self.base,verifier=verifier,boot=lambda:self.boot,**kwargs)
 
-    def prepare(self): return self.store.prepare(manifest())
+    def prepare_store(self,store,release=None):
+        release=release or manifest()
+        candidate=store.target.parent/'Candidate.app'
+        if candidate.exists(): shutil.rmtree(candidate)
+        app(candidate,release['build'])
+        return store.prepare(release,candidate_path=candidate,expanded_size=recovery.tree_digest(candidate)[1])
+
+    def prepare(self): return self.prepare_store(self.store)
 
     def replace(self,build):
         shutil.rmtree(self.target); app(self.target,build)
@@ -58,6 +65,76 @@ class RecoveryTests(unittest.TestCase):
         other=app(self.root/'Unrelated.app',2)
         unknown=recovery.RecoveryStore(other,base=self.base,verifier=trusted,boot=lambda:self.boot)
         with self.assertRaises(UpdateError): unknown.restore(prepared['transaction_id'])
+
+    def test_preparation_crashes_reconcile_and_allow_retry(self):
+        points=('prepare-intent','prepare-directory','prepare-owner','prepare-original-copy','prepare-original-published',
+                'prepare-original-receipt','prepare-backup-copy','prepare-backup-published','prepare-backup-receipt',
+                'prepare-before-journal','prepare-after-journal')
+        for point in points:
+            with self.subTest(point=point), tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary).resolve(); target=app(root/'Monitor.app')
+                store=recovery.RecoveryStore(target,base=root/'state',verifier=verifier,boot=lambda:'boot')
+                def fault(actual):
+                    if actual==point: raise Crash()
+                store.fault=fault
+                with self.assertRaises(Crash): self.prepare_store(store)
+                intent=recovery.load_json(store.state/'preparation.json')
+                self.assertIsNotNone(intent)
+                store.fault=lambda point:None
+                status=store.status()
+                self.assertFalse((store.state/'preparation.json').exists())
+                self.assertEqual(list(store.state.glob('.prepare-*')),[])
+                self.assertEqual(verifier(target)['build'],1)
+                if point=='prepare-after-journal':
+                    self.assertTrue(status['available'])
+                    store.discard(status['transaction_id'])
+                else:
+                    self.assertFalse(status['available'])
+                    self.assertEqual(list(store.backups.glob('*.app')),[])
+                self.assertTrue(self.prepare_store(store)['ok'])
+                self.assertEqual(verifier(store.state/'original.app')['build'],1)
+
+    def test_partial_copy_is_removed_from_proved_staging_only(self):
+        original_copy=recovery.shutil.copytree
+        def interrupted(source,destination,**kwargs):
+            destination.mkdir(); (destination/'partial').write_bytes(b'incomplete')
+            raise Crash()
+        with patch.object(recovery.shutil,'copytree',side_effect=interrupted):
+            with self.assertRaises(Crash): self.prepare()
+        foreign=self.store.state/'unrelated.app'; foreign.mkdir(); (foreign/'keep').write_text('foreign')
+        self.assertFalse(self.store.status()['available'])
+        self.assertEqual(list(self.store.state.glob('.prepare-*')),[])
+        self.assertEqual((foreign/'keep').read_text(),'foreign')
+        self.assertTrue(self.prepare()['ok'])
+
+    def test_foreign_staging_paths_and_extra_contents_are_preserved(self):
+        transaction='e'*32
+        foreign=self.store.state/('.prepare-'+transaction); foreign.mkdir(); (foreign/'keep').write_text('foreign')
+        candidate=app(self.root/'Candidate.app',2)
+        with self.assertRaisesRegex(UpdateError,'foreign bytes preserved'):
+            self.store.prepare(manifest(),transaction_id=transaction,candidate_path=candidate,expanded_size=recovery.tree_digest(candidate)[1])
+        self.assertEqual((foreign/'keep').read_text(),'foreign')
+        self.assertFalse((self.store.state/'preparation.json').exists())
+        def fault(point):
+            if point=='prepare-owner': raise Crash()
+        self.store.fault=fault
+        with self.assertRaises(Crash): self.prepare()
+        intent=recovery.load_json(self.store.state/'preparation.json'); stage=Path(intent['stage_path'])
+        (stage/'foreign.txt').write_text('foreign')
+        with self.assertRaisesRegex(UpdateError,'Foreign preparation contents'): self.store.status()
+        self.assertEqual((stage/'foreign.txt').read_text(),'foreign')
+
+    def test_actual_small_candidate_budget_and_size_binding(self):
+        # 128MiB free accommodates a tiny release and the 64MiB reserve; the
+        # previous archive-size worst-case multiplication would reject this.
+        release=manifest(); release['archive']['size']=1024*1024
+        with patch.object(recovery.shutil,'disk_usage',return_value=type('Disk',(),{'free':128*1024**2})()):
+            prepared=self.prepare_store(self.store,release)
+        self.assertTrue(prepared['ok']); self.store.discard(prepared['transaction_id'])
+        candidate=self.root/'Candidate.app'
+        with self.assertRaisesRegex(UpdateError,'expanded size changed'):
+            self.store.prepare(release,candidate_path=candidate,expanded_size=recovery.tree_digest(candidate)[1]+1)
+        self.assertFalse((self.store.state/'preparation.json').exists())
 
     def test_native_recovery_presentation(self):
         repo=Path(__file__).resolve().parents[1]
@@ -105,18 +182,18 @@ class RecoveryTests(unittest.TestCase):
         first=self.prepare(); original=recovery.load_json(self.store.state/'original.json')
         for build in (2,3,4):
             self.accepted(); self.replace(build)
-            self.store.prepare(manifest(build+1))
+            self.prepare_store(self.store,manifest(build+1))
         self.assertEqual(len(list(self.store.backups.glob('*.app'))),2)
         self.assertEqual(recovery.load_json(self.store.state/'original.json'),original)
         self.assertEqual(verifier(self.store.state/'original.app')['build'],1)
 
     def test_crash_reconciliation_at_every_boundary(self):
-        for point in ('prepared','before-target-rename','after-target-rename','target-saved','before-backup-rename','after-backup-rename','backup-published','before-receipt','after-receipt','accepted'):
+        for point in ('restore-staging','restore-stage-directory','restore-stage-owned','restore-stage-copy','prepared','before-target-rename','after-target-rename','target-saved','before-backup-rename','after-backup-rename','backup-published','before-receipt','after-receipt','accepted'):
             with self.subTest(point=point):
                 with tempfile.TemporaryDirectory() as temp:
                     root=Path(temp).resolve(); target=app(root/'Monitor.app')
                     store=recovery.RecoveryStore(target,base=root/'state',verifier=verifier,boot=lambda:'boot')
-                    prepared=store.prepare(manifest()); shutil.rmtree(target); app(target,2)
+                    prepared=self.prepare_store(store); shutil.rmtree(target); app(target,2)
                     def fault(actual):
                         if actual==point: raise Crash()
                     store.fault=fault
@@ -125,6 +202,28 @@ class RecoveryTests(unittest.TestCase):
                     self.assertEqual(store.restore(prepared['transaction_id'])['phase'],'accepted')
                     self.assertEqual(verifier(target)['build'],1)
                     self.assertTrue(Path(prepared['backup']['path']).exists())
+
+    def test_partial_restore_copy_reconciles_without_manual_cleanup(self):
+        prepared=self.prepare(); self.replace(2)
+        def interrupted(source,destination,**kwargs):
+            (destination/'partial').write_bytes(b'incomplete')
+            raise Crash()
+        with patch.object(recovery.shutil,'copytree',side_effect=interrupted):
+            with self.assertRaises(Crash): self.store.restore(prepared['transaction_id'])
+        record=recovery.load_json(self.store.state/'recovery.json')
+        self.assertEqual(record['phase'],'staging')
+        self.assertEqual(verifier(self.target)['build'],2)
+        self.assertEqual(self.store.restore(prepared['transaction_id'])['restored']['build'],1)
+
+    def test_repeated_restore_staging_crashes_remain_resumable(self):
+        prepared=self.prepare(); self.replace(2)
+        def fault(point):
+            if point=='restore-stage-directory': raise Crash()
+        self.store.fault=fault
+        for _ in range(2):
+            with self.assertRaises(Crash): self.store.restore(prepared['transaction_id'])
+        self.store.fault=lambda point:None
+        self.assertEqual(self.store.restore(prepared['transaction_id'])['restored']['build'],1)
 
     def test_failed_second_rename_rolls_back_without_losing_backup(self):
         prepared=self.prepare(); self.replace(2)

@@ -113,7 +113,10 @@ def tree_digest(root):
                 resolved = path.resolve(strict=True)
                 if not resolved.is_relative_to(root.resolve()):
                     raise UpdateError('Application symlink escapes bundle')
-                h.update(b'L'+os.readlink(path).encode()+b'\0')
+                link=os.readlink(path).encode()
+                size+=len(link)
+                if size>MAX_EXPANDED: raise UpdateError('Application size limit exceeded')
+                h.update(b'L'+link+b'\0')
             elif stat.S_ISDIR(s.st_mode):
                 h.update(b'D')
             elif stat.S_ISREG(s.st_mode) and s.st_nlink == 1:

@@ -15,10 +15,11 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import uuid
 
 from update_contract import UpdateError, integer, read_request, validate_manifest
-from update_preflight import verify_identity, tree_digest, DISK_RESERVE, MAX_RATIO, MAX_EXPANDED
+from update_preflight import verify_identity, tree_digest, DISK_RESERVE, MAX_EXPANDED, MAX_ENTRIES
 
 JOURNAL_SCHEMA='machine-monitor/update-journal/v1'
 RECOVERY_SCHEMA='machine-monitor/recovery-journal/v1'
@@ -168,29 +169,109 @@ class RecoveryStore:
         if not isinstance(value,str) or not re.fullmatch(r'[0-9a-f]{32}',value): raise UpdateError('Invalid transaction identifier')
         return value
 
-    def _copy(self,source,destination,expected):
-        if destination.exists() or destination.is_symlink(): raise UpdateError('Recovery staging path already exists')
-        shutil.copytree(source,destination,symlinks=True)
+    def _copy(self,source,destination,expected,*,empty_existing=False):
+        if empty_existing:
+            if destination.is_symlink() or not destination.is_dir() or destination.stat().st_uid!=os.getuid() or any(destination.iterdir()):
+                raise UpdateError('Recovery staging is not the recorded empty directory')
+        elif destination.exists() or destination.is_symlink(): raise UpdateError('Recovery staging path already exists')
+        shutil.copytree(source,destination,symlinks=True,dirs_exist_ok=empty_existing)
         sync_tree(destination); sync_dir(destination.parent)
         result=self.inspect(destination,expected['identity'])
         if result['sha256']!=expected['sha256']:
             raise UpdateError('Backup copy verification failed')
         return result
 
-    def _space(self,required,*paths):
-        # Group by volume so same-volume allocations are added, not independently
-        # compared against a free-space value that each copy could consume.
+    def _space_bytes(self,*allocations):
         volumes={}
-        for path,count in paths:
+        for path,amount in allocations:
             volume=path.stat().st_dev
-            old=volumes.get(volume,(path,0))
-            volumes[volume]=(path,old[1]+count)
-        for path,count in volumes.values():
-            if shutil.disk_usage(path).free < required*count+DISK_RESERVE:
+            previous=volumes.get(volume,(path,0))
+            volumes[volume]=(path,previous[1]+amount)
+        for path,amount in volumes.values():
+            if shutil.disk_usage(path).free < amount+DISK_RESERVE:
                 raise UpdateError('Insufficient update or recovery space')
 
-    def prepare(self,manifest,credential_generation=0,transaction_id=None):
+    def _space(self,required,*paths):
+        self._space_bytes(*((path,required*count) for path,count in paths))
+
+    def _prepare_paths(self,transaction):
+        self._transaction(transaction)
+        return self.state/('.prepare-'+transaction),self.backups/(transaction+'.app')
+
+    def _reconcile_prepare(self):
+        """Clean only the exact interrupted preparation, never the original backup."""
+        intent=load_json(self.state/'preparation.json')
+        if intent is None: return
+        if intent.get('schema')!='machine-monitor/preparation/v1' or intent.get('target_path')!=str(self.target):
+            raise UpdateError('Invalid preparation authority')
+        transaction=self._transaction(intent.get('transaction_id'))
+        stage,backup=self._prepare_paths(transaction)
+        if intent.get('stage_path')!=str(stage) or intent.get('backup_path')!=str(backup) or type(intent.get('create_original')) is not bool:
+            raise UpdateError('Invalid preparation paths')
+        source=intent.get('source')
+        if not isinstance(source,dict) or source.get('path')!=str(self.target) or not isinstance(source.get('sha256'),str) or not re.fullmatch('[0-9a-f]{64}',source['sha256']):
+            raise UpdateError('Invalid preparation source')
+        journal=self._journal()
+        committed=journal is not None and journal['transaction_id']==transaction
+        original_path=self.state/'original.app'
+        original=load_json(self.state/'original.json')
+        if original:
+            self.verify_record(original,original_path)
+        elif original_path.exists() or original_path.is_symlink():
+            # Publication is an atomic rename from a verified staging copy. A
+            # crash before original.json is recoverable from the persisted intent.
+            if not intent['create_original']: raise UpdateError('Unexpected original backup')
+            original=self.inspect(original_path,source.get('identity'))
+            if original['sha256']!=source['sha256']: raise UpdateError('Original backup does not match preparation')
+            durable_json(self.state/'original.json',original)
+        if backup.exists() or backup.is_symlink():
+            record=self.inspect(backup,source.get('identity'))
+            if record['sha256']!=source['sha256']: raise UpdateError('Preparation backup changed')
+            if not committed:
+                metadata=self.backups/(transaction+'.json')
+                existing=load_json(metadata)
+                if existing is not None and existing!=record: raise UpdateError('Preparation backup receipt changed')
+                # This exact transaction created this complete, duplicate copy;
+                # the verified original is retained independently.
+                if original is None: raise UpdateError('Cannot discard the only retained backup')
+                shutil.rmtree(backup)
+                if existing is not None: metadata.unlink()
+                sync_dir(self.backups)
+        if stage.exists() or stage.is_symlink():
+            info=stage.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o700:
+                raise UpdateError('Preparation staging ownership changed')
+            recorded_inode=intent.get('stage_inode')
+            if recorded_inode is not None and recorded_inode!=info.st_ino:
+                raise UpdateError('Preparation staging was substituted')
+            children={p.name for p in stage.iterdir()}
+            # The only inode-recording gap is an exclusively-created empty
+            # directory. An unmarked directory with foreign content is retained.
+            if recorded_inode is None and children:
+                raise UpdateError('Unidentified preparation contents are preserved')
+            if not children <= {'owner.json','original.app','backup.app'}:
+                raise UpdateError('Foreign preparation contents are preserved')
+            if 'owner.json' in children:
+                if load_json(stage/'owner.json')!={'transaction_id':transaction}:
+                    raise UpdateError('Preparation staging marker changed')
+            elif children:
+                raise UpdateError('Preparation staging marker is missing')
+            for name in children-{'owner.json'}:
+                child=stage/name
+                if child.is_symlink() or not child.is_dir() or child.stat().st_uid!=os.getuid():
+                    raise UpdateError('Preparation child was substituted')
+            count=0; total=0
+            for directory,dirs,files in os.walk(stage,followlinks=False):
+                for name in dirs+files:
+                    info=(Path(directory)/name).lstat(); count+=1; total+=info.st_size
+                    if count>MAX_ENTRIES*2+8 or total>MAX_EXPANDED*2+65536 or info.st_uid!=os.getuid() or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)) or stat.S_ISREG(info.st_mode) and info.st_nlink!=1:
+                        raise UpdateError('Unknown or excessive staging contents are preserved')
+            shutil.rmtree(stage); sync_dir(self.state)
+        (self.state/'preparation.json').unlink(); sync_dir(self.state)
+
+    def prepare(self,manifest,credential_generation=0,transaction_id=None,*,candidate_path=None,expanded_size=None):
         with self.lock():
+            self._reconcile_prepare()
             manifest=validate_manifest(manifest)
             boot_id=self.boot()
             old_journal=self._journal()
@@ -204,27 +285,54 @@ class RecoveryStore:
             validate_manifest(manifest,old['identity']['build'])
             if old['identity']['data_schema_version']!=manifest['data_schema_version']:
                 raise UpdateError('Data schema is incompatible')
+            candidate_path=canonical_target(candidate_path)
+            candidate=self.inspect(candidate_path,manifest)
+            integer(expanded_size,'expanded size',minimum=1,maximum=MAX_EXPANDED)
+            if candidate['size']!=expanded_size:
+                raise UpdateError('Candidate expanded size changed since preflight')
             integer(credential_generation,'credential generation',minimum=0)
             original=load_json(self.state/'original.json')
-            copies=1 if original else 2
-            # Budget backup + extraction/target staging + Sparkle's own copies.
-            self._space(max(old['size'],min(MAX_EXPANDED,manifest['archive']['size']*MAX_RATIO)),(self.state,copies),(self.target.parent,4))
             if original:
                 self.verify_record(original,self.state/'original.app')
-            else:
-                if (self.state/'original.app').exists():
-                    original=self.inspect(self.state/'original.app',old['identity'])
-                    if original['sha256']!=old['sha256']: raise UpdateError('Unrecorded original backup needs manual reconciliation')
-                else:
-                    original=self._copy(self.target,self.state/'original.app',old)
-                durable_json(self.state/'original.json',original)
+            elif (self.state/'original.app').exists() or (self.state/'original.app').is_symlink():
+                raise UpdateError('Unrecorded original backup is preserved')
+            # Download and duplicate extraction already occupy disk and are thus
+            # reflected in current free space. Reserve actual new allocations:
+            # original/update backup, target staging plus a recovery copy, and
+            # Sparkle's archive cache and two expanded working copies. Aggregate
+            # volumes before comparing so a shared disk is never undercounted.
+            self._space_bytes((self.state,old['size']*(1 if original else 2)),
+                              (self.target.parent,candidate['size']+old['size']),
+                              (Path(tempfile.gettempdir()).resolve(),manifest['archive']['size']+candidate['size']*2))
             transaction=self._transaction(transaction_id) if transaction_id is not None else uuid.uuid4().hex
-            backup=self._copy(self.target,self.backups/(transaction+'.app'),old)
-            durable_json(self.backups/(transaction+'.json'),backup)
+            stage,backup_path=self._prepare_paths(transaction)
+            if any(path.exists() or path.is_symlink() for path in (stage,backup_path,self.backups/(transaction+'.json'))):
+                raise UpdateError('Preparation path already exists; foreign bytes preserved')
+            intent={'schema':'machine-monitor/preparation/v1','transaction_id':transaction,'target_path':str(self.target),
+                    'stage_path':str(stage),'backup_path':str(backup_path),'stage_inode':None,
+                    'create_original':original is None,'source':old,'boot_id':boot_id}
+            durable_json(self.state/'preparation.json',intent); self.fault('prepare-intent')
+            stage.mkdir(mode=0o700); sync_dir(self.state); self.fault('prepare-directory')
+            intent['stage_inode']=stage.stat().st_ino
+            durable_json(self.state/'preparation.json',intent)
+            durable_json(stage/'owner.json',{'transaction_id':transaction}); self.fault('prepare-owner')
+            if original is None:
+                original=self._copy(self.target,stage/'original.app',old); self.fault('prepare-original-copy')
+                os.rename(stage/'original.app',self.state/'original.app'); sync_dir(stage); sync_dir(self.state)
+                self.fault('prepare-original-published')
+                original['path']=str(self.state/'original.app')
+                durable_json(self.state/'original.json',original); self.fault('prepare-original-receipt')
+            backup=self._copy(self.target,stage/'backup.app',old); self.fault('prepare-backup-copy')
+            os.rename(stage/'backup.app',backup_path); sync_dir(stage); sync_dir(self.backups)
+            self.fault('prepare-backup-published')
+            backup['path']=str(backup_path)
+            durable_json(self.backups/(transaction+'.json'),backup); self.fault('prepare-backup-receipt')
             journal={'schema':JOURNAL_SCHEMA,'transaction_id':transaction,'target_path':str(self.target),
                      'boot_id':boot_id,'phase':'prepared','old':old['identity']|{'sha256':old['sha256']},
                      'expected':manifest,'backup':backup,'credential_generation':credential_generation}
-            durable_json(self.state/'journal.json',journal)
+            self.fault('prepare-before-journal')
+            durable_json(self.state/'journal.json',journal); self.fault('prepare-after-journal')
+            self._reconcile_prepare()
             self._rotate(transaction)
             return {'ok':True,'state_dir':str(self.state),'transaction_id':transaction,'journal':journal,'backup':backup}
 
@@ -255,6 +363,7 @@ class RecoveryStore:
 
     def status(self):
         with self.lock():
+            self._reconcile_prepare()
             journal=self._journal()
             if not journal: return {'ok':True,'available':False,'message':'No verified previous version is available'}
             self.verify_record(journal['backup'],Path(journal['backup']['path']))
@@ -283,7 +392,7 @@ class RecoveryStore:
         if value.get('schema')!=RECOVERY_SCHEMA or value.get('target_path')!=str(self.target): raise UpdateError('Invalid restoration journal')
         stage,saved=self._recovery_paths(value.get('transaction_id'))
         if value.get('stage_path')!=str(stage) or value.get('saved_path')!=str(saved): raise UpdateError('Invalid restoration paths')
-        if value.get('phase') not in ('prepared','target-saved','backup-published','accepted','rolled-back'): raise UpdateError('Invalid restoration phase')
+        if value.get('phase') not in ('staging','prepared','target-saved','backup-published','accepted','rolled-back'): raise UpdateError('Invalid restoration phase')
         return value
 
     def _matches(self,path,record):
@@ -327,16 +436,12 @@ class RecoveryStore:
             stage,saved=self._recovery_paths(transaction)
             if saved.exists() or saved.is_symlink(): raise UpdateError('Saved recovery target already exists')
             self._space(backup['size'],(self.target.parent,1))
-            if stage.exists():
-                staged=self.inspect(stage,backup['identity'])
-                if staged['sha256']!=backup['sha256']: raise UpdateError('Incomplete recovery staging needs manual reconciliation')
-            else:
-                staged=self._copy(Path(backup['path']),stage,backup)
+            if stage.exists() or stage.is_symlink(): raise UpdateError('Unrecorded restoration staging is preserved')
             restore={'schema':RECOVERY_SCHEMA,'transaction_id':transaction,'target_path':str(self.target),
-                     'stage_path':str(stage),'saved_path':str(saved),'phase':'prepared','backup':backup,'old':current,
-                     'staged':staged,'boot_id':self.boot()}
+                     'stage_path':str(stage),'saved_path':str(saved),'phase':'staging','backup':backup,'old':current,
+                     'stage_inode':None,'boot_id':self.boot()}
             durable_json(self.state/'recovery.json',restore)
-            self.fault('prepared')
+            self.fault('restore-staging')
             return self._resume(restore,journal)
 
     def _phase(self,restore,phase):
@@ -347,6 +452,31 @@ class RecoveryStore:
         stage,saved=self._recovery_paths(restore['transaction_id'])
         if stage.is_symlink() or saved.is_symlink(): raise UpdateError('Restoration path was replaced by a symlink')
         backup=restore['backup']; old=restore['old']
+        if backup!=journal['backup'] or old.get('path')!=str(self.target):
+            raise UpdateError('Restoration records disagree with transaction authority')
+        if restore['phase']=='staging':
+            self._matches(self.target,old)
+            if saved.exists() or saved.is_symlink(): raise UpdateError('Unexpected saved target before restoration')
+            if stage.exists():
+                info=stage.lstat(); recorded=restore.get('stage_inode')
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or recorded is not None and info.st_ino!=recorded:
+                    raise UpdateError('Restoration staging identity changed')
+                if recorded is None and any(stage.iterdir()): raise UpdateError('Unidentified restoration contents are preserved')
+                count=0; total=0
+                for directory,dirs,files in os.walk(stage,followlinks=False):
+                    for name in dirs+files:
+                        info=(Path(directory)/name).lstat(); count+=1; total+=info.st_size
+                        if count>MAX_ENTRIES or total>MAX_EXPANDED+65536 or info.st_uid!=os.getuid() or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)) or stat.S_ISREG(info.st_mode) and info.st_nlink!=1:
+                            raise UpdateError('Unknown restoration staging contents are preserved')
+                shutil.rmtree(stage); sync_dir(stage.parent)
+            self._space(backup['size'],(self.target.parent,1))
+            restore['stage_inode']=None
+            durable_json(self.state/'recovery.json',restore)
+            stage.mkdir(mode=0o700); sync_dir(stage.parent); self.fault('restore-stage-directory')
+            restore['stage_inode']=stage.stat().st_ino
+            durable_json(self.state/'recovery.json',restore); self.fault('restore-stage-owned')
+            self._copy(Path(backup['path']),stage,backup,empty_existing=True); self.fault('restore-stage-copy')
+            self._phase(restore,'prepared')
         if restore['phase']=='prepared':
             # Crash after first rename but before phase persistence: verify saved
             # bytes and absence of target, never infer authority from existence.
@@ -406,12 +536,12 @@ def main(stdin=None,stdout=None):
     stdin=stdin or sys.stdin; stdout=stdout or sys.stdout
     try:
         request=read_request(stdin)
-        allowed={'action','target_path','manifest','transaction_id','credential_generation'}
+        allowed={'action','target_path','manifest','transaction_id','credential_generation','candidate_path','expanded_size'}
         if set(request)-allowed or request.get('action') not in ('status','prepare','restore','discard'):
             raise UpdateError('Invalid recovery request')
         store=RecoveryStore(request.get('target_path'))
         action=request['action']
-        if action=='prepare': result=store.prepare(request.get('manifest'),request.get('credential_generation',0),request.get('transaction_id'))
+        if action=='prepare': result=store.prepare(request.get('manifest'),request.get('credential_generation',0),request.get('transaction_id'),candidate_path=request.get('candidate_path'),expanded_size=request.get('expanded_size'))
         elif action=='restore': result=store.restore(request.get('transaction_id'))
         elif action=='discard': result=store.discard(request.get('transaction_id'))
         else: result=store.status()
