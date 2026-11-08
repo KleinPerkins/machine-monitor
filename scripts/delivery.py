@@ -126,7 +126,14 @@ class Cloudflare:
 
     def wrangler(self, *args, timeout=60):
         # Capture all output: even upstream diagnostics must never expose credentials.
-        environment = dict(os.environ, WRANGLER_SEND_METRICS='false', CI='true', NO_COLOR='1')
+        environment = dict(os.environ, WRANGLER_SEND_METRICS='false', WRANGLER_SEND_ERROR_REPORTS='false',
+                           WRANGLER_WRITE_LOGS='false', WRANGLER_LOG='none', WRANGLER_LOG_SANITIZE='true',
+                           CLOUDFLARE_API_BASE_URL='https://api.cloudflare.com/client/v4',
+                           CF_API_BASE_URL='https://api.cloudflare.com/client/v4', CI='true', NO_COLOR='1')
+        for name in ('WRANGLER_OUTPUT_FILE_PATH', 'WRANGLER_OUTPUT_FILE_DIRECTORY', 'CLOUDFLARE_ENV'):
+            environment.pop(name, None)
+        if self.config.get('account_id'):
+            environment['CLOUDFLARE_ACCOUNT_ID'] = self.config['account_id']
         try:
             result = subprocess.run([self.config['wrangler'], *args], stdin=subprocess.DEVNULL,
                                     capture_output=True, env=environment, cwd=ROOT, timeout=timeout)
