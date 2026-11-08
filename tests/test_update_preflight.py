@@ -8,6 +8,7 @@ import plistlib
 import stat
 import struct
 import sys
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -32,7 +33,7 @@ class PreflightTests(unittest.TestCase):
     def test_valid_archive_and_no_collector_import(self):
         result=self.extract()
         self.assertTrue(result['ok']); self.assertEqual(result['identity']['build'],2)
-        self.assertNotIn('monitor',sys.modules)
+        subprocess.run([sys.executable,'-c',"import sys; import update_preflight; import update_recovery; assert 'monitor' not in sys.modules"],cwd=Path(__file__).resolve().parents[1],check=True,timeout=10)
 
     def test_invalid_paths(self):
         for name in ('../Monitor.app/a','/Monitor.app/a','C:/Monitor.app/a','Monitor.app/../a','Monitor.app//a','Monitor.app/./a','Monitor.app\\a','Other/a'):
