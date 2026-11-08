@@ -45,7 +45,7 @@ def verify_identity(app, expected=None):
     requirement = ('anchor apple generic and certificate leaf[subject.OU] = "' + TEAM_ID + '" '
                    'and certificate leaf[field.1.2.840.113635.100.6.1.13] exists '
                    'and identifier "' + APP_ID + '"')
-    run_checked(['/usr/bin/codesign','--verify','--deep','--strict','-R',requirement,str(app)])
+    run_checked(['/usr/bin/codesign','--verify','--deep','--strict','-R','='+requirement,str(app)])
     run_checked(['/usr/sbin/spctl','--assess','--type','execute',str(app)])
     try:
         with (app/'Contents/Info.plist').open('rb') as stream:

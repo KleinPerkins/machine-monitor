@@ -104,6 +104,7 @@ class PreflightTests(unittest.TestCase):
         with patch.object(preflight.sys,'platform','darwin'),patch.object(preflight,'run_checked',side_effect=command) as calls:
             self.assertEqual(preflight.verify_identity(app)['data_schema_version'],1)
             self.assertIn('anchor apple generic',calls.call_args_list[0].args[0][-2])
+            self.assertTrue(calls.call_args_list[0].args[0][-2].startswith('=anchor apple generic'))
             self.assertIn('spctl',calls.call_args_list[1].args[0][0])
             info['CFBundleVersion']='2'; path.write_bytes(plistlib.dumps(info))
             with self.assertRaises(UpdateError): preflight.verify_identity(app)
@@ -164,6 +165,22 @@ class PreflightTests(unittest.TestCase):
             with self.assertRaises(UpdateError): read_request(io.StringIO(payload))
         output=io.StringIO(); self.assertEqual(preflight.main(io.StringIO('{"fixture_bypass":true}'),output),1)
         self.assertFalse(json.loads(output.getvalue())['ok'])
+
+    def test_real_codesign_inline_expression_requires_literal_prefix(self):
+        binary=self.root/'signed-fixture'
+        subprocess.run(['xcrun','clang','-arch','arm64','-x','c','-','-o',str(binary)],
+                       input=b'int main(void) { return 0; }\n',check=True,capture_output=True,timeout=60)
+        identifier='com.kleinperkins.machine-monitor.requirement-fixture'
+        subprocess.run(['/usr/bin/codesign','--force','--sign','-','--identifier',identifier,str(binary)],
+                       check=True,capture_output=True,timeout=20)
+        expression='identifier "'+identifier+'"'
+        def verify(requirement):
+            return subprocess.run(['/usr/bin/codesign','--verify','--strict','-R',requirement,str(binary)],
+                                  capture_output=True,timeout=20)
+        self.assertNotEqual(verify(expression).returncode,0)
+        accepted=verify('='+expression)
+        self.assertEqual(accepted.returncode,0,accepted.stderr.decode(errors='replace'))
+        self.assertNotEqual(verify('=identifier "different.fixture"').returncode,0)
 
 
 if __name__=='__main__': unittest.main()
