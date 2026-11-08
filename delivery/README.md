@@ -34,7 +34,7 @@ replicas, so it is never retained across requests. Expired/revoked/unknown grant
 fail closed. Qualification requires both an owner grant and an explicit
 qualification entitlement, enforced by SQL and the Worker. Owner status alone
 grants no stable access. Every response is private/no-store, including errors and
-HEADs. There is no Cache API, redirect, CORS, public asset binding, object URL,
+HEADs. There is no Cache API, redirect, CORS, generic asset fallback, object URL,
 conditional-304 response or range bypass. Authenticated ranges return 416.
 Database/storage/invalid-release failures return 503 without internal diagnostics.
 Revocation affects subsequent requests; it cannot revoke in-flight/downloaded bytes.
@@ -52,77 +52,139 @@ and token references and revokes object URLs; this does not claim secure memory
 erasure. Nothing is stored in localStorage/sessionStorage/cookies. No analytics,
 third-party assets, telemetry or service worker is installed.
 
-## Owner tooling interface
+## Free-only owner tooling interface
 
-`scripts/delivery.py` is import-safe. All operations require an explicit canonical,
-owner-owned mode-0600 config **outside every Git repository**. Copy
-`owner-config.example.json` into a private directory and supply explicit existing
-bindings; `wrangler.template.json` illustrates generated bindings only. Wrangler
-must be preinstalled at exactly **4.158.0**; Node must be exactly **26.4.0**
-(`MONITOR_NODE` may select the pinned executable). There is no unpinned installer.
+This is a source/synthetic implementation of the approved Free-only successor,
+not a live hosting or zero-charge qualification receipt. Every provider mutation
+requires a fresh, explicit owner observation that the configured account is on
+**Workers Free**. There is no R2 binding, subscription/upgrade command, paid
+fallback, public object URL, or `--assume-free` bypass. An independent account
+owner can change its plan; this tool cannot prevent that. Unknown/paid/stale or
+wrong-account evidence blocks creation, deployment and publication.
 
-The CLI captures `wrangler auth token --json` directly into process memory using
-the original owner HOME/auth context and refresh behavior. It never displays or
-persists that output, never puts credentials in argv, suppresses upstream raw
-output, rejects API redirects and disables Wrangler disk logs, metrics, error reports and Worker observability. It clears inherited output-file overrides, enforces log sanitization and the official API base, and uses the explicitly configured account. The normal log level is retained because this pinned Wrangler also suppresses machine-readable version/authentication output at quieter levels. All stdout and stderr remain captured in the owner process and are never forwarded; disk logging and telemetry remain disabled.
-It supports OAuth/API-token auth; global API-key/email auth is refused. Only the
-normal Cloudflare API origin receives the owner credential. The CLI is never
-executed by the public UI, Worker or recipient applications.
+`scripts/delivery.py` is import-safe. Use an explicit canonical owner-owned
+mode-0600 configuration outside Git. `owner-config.example.json` lists every key.
+`assets_directory` must already exist outside Git, be owner-owned and mode 0700.
+Its descendants must be mode-0700 directories and mode-0600 regular part files;
+symlinks, foreign ownership, unrelated files, `_headers`, `_redirects`, HTML/SPA
+fallbacks and routing control files are rejected. Artifact bytes and private
+observations never belong in source or public CI output.
 
-- `--config /private/config.json check-privacy` reads current R2 domain settings:
-  managed `enabled=false` and no custom domains are required. Unknown state fails.
-- `--config /private/config.json deploy` repeats that gate, applies the additive
-  fixed D1 schema, and deploys the Worker with existing explicit bindings,
-  preview URLs disabled. An approved custom hostname uses a custom-domain route
-  with workers.dev disabled. Alternatively an explicit workers.dev origin must
-  match exactly `{worker_name}.{account_owned_subdomain}.workers.dev`, proven
-  through the read-only account `/workers/subdomain` API before any schema/deploy
-  write; that choice enables workers.dev and uses no custom-domain routes. No
-  subdomain is claimed/created, no aliases or preview origins are accepted by the
-  Worker, and no separate custom-domain prerequisite applies. No account,
-  database, bucket, paid plan or account upgrade is created/enabled. This operation
-  still requires the owner-authorized deployment gate.
-- `--config /private/config.json create-grant --label OPAQUE_LABEL --expires-at UNIX_SECONDS --output /private/recipient.machine-monitor-access`
-  generates 32 random bytes, stores SHA256(token) only and writes a new mode-0600
-  file without overwriting any existing path. Add `--owner --channel qualification`
-  for a finite owner-only qualification grant. Share files privately through the
-  owner's chosen channel; this tooling sends no messages.
-- `--config /private/config.json revoke-grant --grant-id OPAQUE_UUID` revokes that
-  grant. No credential is required as a command argument.
-- `--config /private/config.json publish --manifest /private/release.json --receipt /private/qualification.json --archive /private/update.zip --package /private/first-install.zip`
-  publishes a qualification release. The tool takes bounded private snapshots,
-  checks both sizes/hashes, uploads content-addressed private objects, downloads
-  and hashes each readback, and appends the immutable release record before
-  advancing its channel. D1 triggers prevent update/deletion of release rows.
-  Equal or decreasing builds cannot move a channel backward. Exact publication
-  retries are idempotent; a reused ID with different metadata fails.
-- For stable promotion use the same `publish` command with stable/qualified release
-  JSON and omit archive/package arguments. It must match the existing qualification
-  manifest exactly except channel/qualified. Both retained objects are downloaded
-  and reverified; no replacement archive may be uploaded during promotion.
+`free_plan_proof` names a separate private mode-0600 JSON file with **exactly**:
 
-The private qualification receipt is
-`schema=machine-monitor/qualification/v1`, with exact `qualification_id`,
-`source_revision`, `app_id`, `build`, `archive_sha256`, `archive_size`,
-`first_install_sha256`, `first_install_size`, and `checks`. Required true checks are
-`ci_required`, `merged_source`, `developer_id`, `notarization`, `stapled_ticket`,
-`gatekeeper`, `archive_signature`, `recovery_packaged`. Stable additionally requires
-`private_upgrade=true`, bound to the same exact archive hashes. These are owner
-release-gate assertions backed by actual release evidence; merely creating JSON
-is not qualification. The component does not manufacture evidence or activate
-publishing on source merge.
+```json
+{
+  "schema": "machine-monitor/free-plan-observation/v1",
+  "account_id": "OWNER_EXPLICIT_ACCOUNT_ID",
+  "observed_plan": "Workers Free",
+  "source": "owner-dashboard-observation",
+  "source_reference": "OWNER_ACTUAL_DASHBOARD_OR_MESSAGE_REFERENCE",
+  "observed_at": 0,
+  "expires_at": 0
+}
+```
 
-Private bucket settings must remain disabled in account governance after deploy;
-Cloudflare account administrators can change bindings/public access, and source
-code cannot prevent an administrator from doing so. Content-addressed object
-names and owner-tool readback verification preserve the immutable-byte contract
-within this tool; publisher signatures and recipient verification detect external
-storage tampering. No public GitHub binary assets are created.
+The zero timestamps are placeholders that fail closed. Actual timestamps are Unix
+integer seconds: observation must not be in the future, expiry must be after now
+and at most one hour after observation. This records the owner's dashboard
+observation with its provenance; it is **not independent provider API proof**.
+Renew it only from a new actual observation. No actual owner account, URL,
+observation, access file or artifact is included in this repository.
+
+Wrangler must be preinstalled at exactly **4.158.0**, and Node at **26.4.0**
+(`MONITOR_NODE` can select the executable). The original owner HOME/auth context
+is retained. `wrangler auth token --json` output is captured only in process
+memory; no token enters argv/config/logs/recipient apps. OAuth/API-token auth is
+supported; global key/email auth is refused. Wrangler's normal `log` level is
+required because quieter levels suppress its JSON output. All stdout/stderr stay
+captured; disk logging, metrics, error reporting, observability and inherited
+output-file overrides are disabled. API redirects and nonofficial origins deny.
+
+- `--config /private/config.json deploy` checks Free evidence, exact account-owned
+  `{worker}.{subdomain}.workers.dev` origin and the complete private asset tree,
+  applies the additive D1 schema and deploys one version at 100 percent. Generated
+  configuration always uses `assets.binding=ASSETS`, unconditional boolean
+  `run_worker_first=true`, `html_handling=none`, `not_found_handling=none` and
+  `preview_urls=false`. No negative routing patterns or static-first route exist.
+  Custom domains and zone routes are currently refused: they require a separately
+  qualified fail-closed profile. The canonical workers.dev hostname is the only
+  supported origin; default aliases and preview/version hosts deny in the Worker.
+- `deployment_state` is an explicit private, atomically replaced mode-0600 receipt
+  binding the successful Wrangler-reported version ID, provider version etag,
+  exact local source/configuration and complete retained asset inventory. The tool
+  reads the active deployment back, including entries at **0 percent**; exactly
+  one recognized version at 100 percent is required. It checks preview/default
+  settings, account custom domains and every account-owned zone's Worker routes.
+  Missing permissions or unknown API shape fail closed. This receipt is operation
+  provenance, not independent live CPU/quota/signing qualification. Lost/unknown
+  state is a blocker, never permission to replace existing deployment history.
+- `--config /private/config.json check-privacy` repeats the exact active-version,
+  source/configuration/origin/preview/route readbacks without altering retention.
+- `create-grant --label OPAQUE_LABEL --expires-at UNIX_SECONDS --output /private/recipient.machine-monitor-access`
+  creates a 256-bit random recipient token, stores only SHA256(token), and writes
+  a new mode-0600 file. Qualification needs `--owner --channel qualification` and
+  finite expiry. `revoke-grant --grant-id OPAQUE_UUID` revokes future requests.
+  The owner shares access files privately; this tool sends no messages.
+- `publish --manifest /private/release.json --receipt /private/qualification.json --archive /private/update.zip --package /private/first-install.zip`
+  validates qualification evidence and full artifact sizes/hashes; splits each ZIP
+  into ordered parts of at most **20 MiB**, below the 25-MiB file limit; retains
+  the full asset set and deploys it **before** publishing any D1 release/channel.
+  Immutable D1 part metadata binds each ordered path/length/hash to app, release,
+  kind and full-artifact hash. The full SHA256/Ed25519 manifest descriptors and
+  authenticated archive/package URLs are unchanged. A temporary owner-only
+  qualification grant reads complete bytes back through those protected URLs;
+  exact hash/length verification precedes channel advancement. A readback failure
+  may retain an immutable qualification row but never advances its channel.
+- Stable publication uses the same command with stable/qualified manifest and no
+  archive/package inputs. The existing qualification manifest must match exactly
+  except channel/qualified. Both retained artifacts are read back again; stable
+  promotion never stages or uploads replacement bytes. Equal/decreasing builds
+  cannot move a channel backward. Exact retries are idempotent.
+
+Every later deployment preserves **all** previously deployed and D1-referenced
+parts, including current, candidate and required rollback assets. There is no
+retention deletion operation or automatic garbage collection. Preflight hashes
+all local retained files and rejects more than 20,000 assets or any file over
+20 MiB. A complete artifact remains bounded to 512 MiB (at most 26 parts); both
+ZIPs/candidates/rollback sets count toward the file bound. Empty initial asset
+sets are supported if the pinned provider tool accepts them; failure is a blocker.
+Direct `Cloudflare` mutation methods enforce the same Free gate. Narrow guarded
+`create_database(name)` and `create_subdomain(name)` bootstrap methods permit an
+explicit new D1 database (known available Free count below ten) or a previously
+unclaimed account subdomain. They never replace an existing subdomain, activate
+billing or create storage subscriptions. Bootstrap still requires separate owner
+authorization; source imports do not execute these methods.
+
+Qualification receipts use `schema=machine-monitor/qualification/v1`, exact
+`qualification_id`, `source_revision`, `app_id`, `build`, both artifact SHA256/size
+pairs and true checks `ci_required`, `merged_source`, `developer_id`,
+`notarization`, `stapled_ticket`, `gatekeeper`, `archive_signature`,
+`recovery_packaged`. Stable additionally requires `private_upgrade=true` for the
+same bytes. A JSON assertion is not actual qualification evidence.
+
+The Worker authenticates in the **first query of a fresh first-primary D1
+session**, before any asset binding fetch. It constructs credential-free internal
+part requests, checks status/length, streams one part at a time with backpressure,
+30-second fetch/read bounds and at most 26 part requests. It never buffers/hashes
+an entire artifact. Missing/truncated/oversized/quota-failed parts abort; recipient
+full hash/signature validation rejects incomplete or tampered bytes. Cancellation
+stops the current reader. External guessed part paths deny, even with a token.
+Conditional requests deny after authorization; ranges return 416. Override
+headers deny, and every active version must be reviewed because the provider can
+route an override to a zero-percent version **before** executing Worker code.
+
+Workers Free request exhaustion can return 429/platform error 1027 before Worker
+execution; D1/asset quota errors deny or abort. Unconditional worker-first avoids
+static fallback. Installed local monitoring remains available. Live acceptance
+still must measure Free CPU under 10 ms, memory under 128 MB, account-shared daily
+request/D1 quotas, D1 database/storage capacity, all active versions and alias/
+override/route behavior, plus actual signed older-to-newer upgrades. Synthetic
+fixtures prove source behavior only and create no provider resources.
 
 ## Synthetic validation
 
 `tests/test_update_channel.py` runs the actual Worker against Node's in-memory
-SQLite and fixture R2 (not a rewritten authorization model), plus owner-tool
+SQLite and fixture Static Assets (not a rewritten authorization model), plus owner-tool
 checks. `tests/test_update_download_layout.py` and
 `tests/test_update_download_lifecycle.py` launch a bounded loopback HTTPS fixture
 using a disposable self-signed certificate and a fresh Chromium context. Test TLS
@@ -137,9 +199,11 @@ older/newer upgrade remain independent release gates.
 
 Primary implementation references:
 [D1 Sessions API](https://developers.cloudflare.com/d1/worker-api/d1-database/#withsession),
-[R2 Worker API](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/),
+[Static Assets Free limits](https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/),
+[Worker-first routing](https://developers.cloudflare.com/workers/static-assets/routing/worker-script/),
+[Version overrides including zero-percent versions](https://developers.cloudflare.com/workers/versions-and-deployments/version-overrides/),
 [Wrangler owner auth](https://developers.cloudflare.com/workers/wrangler/commands/general/#auth-token),
-[R2 domain settings API](https://developers.cloudflare.com/api/resources/r2/subresources/buckets/subresources/domains/),
+[Workers versions API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/versions/methods/get/),
 [Wrangler config](https://developers.cloudflare.com/workers/wrangler/configuration/).
 
 Pinned-source checks for this owner-auth path: [4.158.0 auth command](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.158.0/packages/wrangler/src/user/commands.ts), [JSON logger and disk-log opt-out](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.158.0/packages/wrangler/src/logger.ts).

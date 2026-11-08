@@ -42,3 +42,17 @@ CREATE TRIGGER IF NOT EXISTS release_immutable_update BEFORE UPDATE ON releases
 BEGIN SELECT RAISE(ABORT,'immutable release'); END;
 CREATE TRIGGER IF NOT EXISTS release_immutable_delete BEFORE DELETE ON releases
 BEGIN SELECT RAISE(ABORT,'immutable release'); END;
+
+-- Ordered parts are bound to app/release/kind/full-artifact hash and append-only.
+CREATE TABLE IF NOT EXISTS artifact_parts (
+  app_id TEXT NOT NULL,
+  release_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('archive','package')),
+  artifact_sha256 TEXT NOT NULL CHECK(length(artifact_sha256)=64),
+  parts_json TEXT NOT NULL CHECK(json_valid(parts_json)),
+  PRIMARY KEY(app_id,release_id,kind,artifact_sha256)
+);
+CREATE TRIGGER IF NOT EXISTS parts_immutable_update BEFORE UPDATE ON artifact_parts
+BEGIN SELECT RAISE(ABORT,'immutable parts'); END;
+CREATE TRIGGER IF NOT EXISTS parts_immutable_delete BEFORE DELETE ON artifact_parts
+BEGIN SELECT RAISE(ABORT,'immutable parts'); END;

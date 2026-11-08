@@ -3,7 +3,9 @@
   "account_id": "OWNER_EXPLICIT_ACCOUNT_ID",
   "database_id": "OWNER_EXPLICIT_D1_DATABASE_ID",
   "database_name": "owner-explicit-database-name",
-  "bucket_name": "owner-explicit-private-bucket-name",
   "worker_name": "owner-explicit-worker-name",
-  "wrangler": "/ABSOLUTE/PATH/TO/PREINSTALLED/wrangler"
+  "wrangler": "/ABSOLUTE/PATH/TO/PREINSTALLED/wrangler",
+  "assets_directory": "/OWNER/CANONICAL/PRIVATE/ASSETS",
+  "free_plan_proof": "/OWNER/PRIVATE/free-plan-observation.json",
+  "deployment_state": "/OWNER/PRIVATE/deployment-state.json"
 }

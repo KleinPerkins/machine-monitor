@@ -36,21 +36,49 @@ class MemoryAPI:
         self.uploads = []
         self.checked_privacy = False
         self.readbacks = []
+        self.events = []
+        self.folder = tempfile.TemporaryDirectory()
+        self.root = Path(self.folder.name).resolve()
+        self.assets = self.root / 'assets'
+        self.assets.mkdir(mode=0o700)
+        self.config = config_fixture(self.root)
+        self.uploads = []
 
     def query(self, sql, params=()):
         self.calls.append((sql, params))
+        self.events.append(sql.split()[0] + ':' + ('channels' if 'INTO channels' in sql else 'releases' if 'INTO releases' in sql else 'query'))
         cursor = self.db.execute(sql, params)
         return [dict(row) for row in cursor.fetchall()]
 
     def privacy(self):
         self.checked_privacy = True
 
-    def readback(self, key, digest, size):
-        self.readbacks.append((key, digest, size))
+    def require_free(self):
+        return delivery.require_free(self.config)
 
-    def put_checked(self, path, key, digest):
-        self.uploads.append((key, delivery.file_digest(path)))
-        assert self.uploads[-1][1][0] == digest
+    def deploy(self):
+        self.require_free()
+        self.events.append('deploy')
+        self.uploads = list(delivery.asset_inventory(self.config))
+
+    def readback(self, release_id, descriptor, kind):
+        self.events.append('readback')
+        self.readbacks.append((release_id, descriptor, kind))
+
+
+def config_fixture(root):
+    assets = root / 'assets'
+    assets.mkdir(mode=0o700, exist_ok=True)
+    now = int(time.time())
+    proof = dict(schema='machine-monitor/free-plan-observation/v1', account_id='a' * 32,
+                 observed_plan='Workers Free', source='owner-dashboard-observation',
+                 source_reference='owner-chat:synthetic-fixture-not-live-evidence', observed_at=now - 1, expires_at=now + 300)
+    filename = root / 'free.json'
+    if not filename.exists(): delivery.private_write(filename, proof)
+    return dict(origin='https://monitor.owned-fixture.workers.dev', worker_name='monitor',
+                account_id='a' * 32, database_name='fixture', database_id='b' * 36,
+                assets_directory=str(assets), free_plan_proof=str(filename),
+                deployment_state=str(root / 'deployment.json'), wrangler='/fixture/wrangler')
 
 
 def release(channel='qualification'):
@@ -75,6 +103,7 @@ class ChannelTests(unittest.TestCase):
     def setUp(self):
         self.api = MemoryAPI()
         self.addCleanup(self.api.db.close)
+        self.addCleanup(self.api.folder.cleanup)
 
     def test_actual_worker_primary_reads_auth_cache_isolation_and_errors(self):
         result = subprocess.run([node(), str(ROOT / 'tests/helpers/update_worker.mjs')], cwd=ROOT,
@@ -164,7 +193,9 @@ class ChannelTests(unittest.TestCase):
             delivery.publish(self.api, tampered, receipt(tampered))
         delivery.publish(self.api, stable, proof)
         self.assertEqual(len(self.api.uploads), 2, 'stable cannot upload different bytes')
-        self.assertEqual(len(self.api.readbacks), 2, 'stable must reverify retained bytes')
+        self.assertEqual(len(self.api.readbacks), 4, 'qualification and stable both reverify retained bytes')
+        self.assertLess(self.api.events.index('deploy'), self.api.events.index('INSERT:releases'))
+        self.assertLess(self.api.events.index('readback'), self.api.events.index('INSERT:channels'))
         delivery.publish(self.api, stable, proof)  # exact retry is idempotent
         self.assertEqual(self.api.query("SELECT release_id FROM channels WHERE channel='stable'")[0]['release_id'], 'release-2')
         older = release()
@@ -193,76 +224,150 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(self.api.query('SELECT * FROM releases'), [])
         self.assertEqual(self.api.uploads, [])
 
-    def test_privacy_api_denies_public_buckets_and_all_api_redirects(self):
+    def test_free_proof_blocks_every_mutation_and_no_boolean_bypass(self):
+        config = self.api.config
+        original = delivery.private_json(config['free_plan_proof'])
+        invalid = [{}, dict(original, observed_plan='Workers Paid'), dict(original, account_id='c' * 32),
+                   dict(original, observed_at=1, expires_at=100), dict(original, observed_at=int(time.time()) + 30),
+                   dict(original, expires_at=original['observed_at'] + 3601), dict(original, source='assume-free'),
+                   dict(original, assume_free=True)]
         api = delivery.Cloudflare.__new__(delivery.Cloudflare)
-        api.config = {'bucket_name': 'fixture'}
-        for managed, custom in (({'enabled': True}, {'domains': []}), ({'enabled': False}, {'domains': [{'domain': 'public.invalid'}]}), ({}, {})):
-            with patch.object(api, 'api', side_effect=[managed, custom]), self.assertRaises(delivery.DeliveryError):
-                api.privacy()
-        with patch.object(api, 'api', side_effect=[{'enabled': False}, {'domains': []}]):
-            api.privacy()
+        api.config = config
+        api._opener = MagicMock()
+        for proof in invalid:
+            Path(config['free_plan_proof']).write_text(json.dumps(proof))
+            for operation in (lambda: api.api('/d1/database', {'name': 'new'}),
+                              lambda: api.query('CREATE TABLE forbidden(x)'), lambda: api.create_database('new'),
+                              lambda: api.create_subdomain('new'), lambda: api.deploy(),
+                              lambda: api.wrangler('deploy', '--config', '/unused'),
+                              lambda: delivery.publish(api, release(), receipt(release())),
+                              lambda: delivery.create_grant(api, config, 'fixture', self.api.root / 'unused', int(time.time()) + 30)):
+                with self.assertRaises(delivery.DeliveryError): operation()
+            api._opener.open.assert_not_called()
+        Path(config['free_plan_proof']).write_text(json.dumps(original))
+        self.assertEqual(delivery.require_free(config)['source'], 'owner-dashboard-observation')
+        with self.assertRaises(delivery.DeliveryError):
+            api.wrangler('r2', 'object', 'put', 'forbidden')
+        with self.assertRaises(delivery.DeliveryError):
+            api.api('/subscriptions', {'plan': 'paid'})
         with self.assertRaises(delivery.DeliveryError):
             delivery.NoRedirect().redirect_request(None, None, None, None, None, None)
 
-    def test_deployment_supports_exact_owned_workers_dev_primary_origin(self):
-        config = dict(origin='https://monitor.owned-fixture.workers.dev', worker_name='monitor',
-                      account_id='a' * 32, database_name='fixture', database_id='b' * 36,
-                      bucket_name='fixture', wrangler='/fixture/wrangler')
-        api = delivery.Cloudflare.__new__(delivery.Cloudflare)
-        api.config = config
-        with patch.object(api, 'api', return_value={'subdomain': 'owned-fixture'}) as current:
+    def test_bootstrap_only_creates_new_free_resources_with_capacity(self):
+        api = delivery.Cloudflare.__new__(delivery.Cloudflare);api.config=self.api.config
+        with patch.object(api,'api',side_effect=[[],{'uuid':'synthetic-only'}]) as calls:
+            self.assertEqual(api.create_database('new-fixture'),{'uuid':'synthetic-only'})
+            self.assertEqual(calls.call_args.args,('/d1/database',{'name':'new-fixture'},'POST'))
+        for databases in ([{'name':'new-fixture'}], [{'name':'x'}] * 10, None):
+            with patch.object(api,'api',return_value=databases) as calls, self.assertRaises(delivery.DeliveryError):api.create_database('new-fixture')
+            self.assertEqual(calls.call_count,1)
+        with patch.object(api,'api',side_effect=[{'subdomain':''},{'subdomain':'new-fixture'}]) as calls:
+            self.assertEqual(api.create_subdomain('new-fixture')['subdomain'],'new-fixture')
+            self.assertEqual(calls.call_args.args,('/workers/subdomain',{'subdomain':'new-fixture'},'PUT'))
+        with patch.object(api,'api',return_value={'subdomain':'existing'}) as calls, self.assertRaises(delivery.DeliveryError):api.create_subdomain('new-fixture')
+        self.assertEqual(calls.call_count,1)
+
+    def test_deployment_requires_unconditional_private_worker_first_and_owned_origin(self):
+        config = self.api.config
+        api = delivery.Cloudflare.__new__(delivery.Cloudflare);api.config = config
+        with patch.object(api, 'api', return_value={'subdomain': 'owned-fixture'}):
             result = delivery.deployment_config(config, api)
-            current.assert_called_once_with('/workers/subdomain')
-        self.assertTrue(result['workers_dev'])
-        self.assertFalse(result['preview_urls'])
+        self.assertTrue(result['workers_dev']);self.assertFalse(result['preview_urls'])
         self.assertEqual(result['routes'], [])
-        self.assertEqual(result['vars']['UPDATE_ORIGIN'], config['origin'])
         self.assertEqual(result['d1_databases'][0]['binding'], 'DB')
-        self.assertEqual(result['r2_buckets'][0]['binding'], 'ARCHIVES')
-        with self.assertRaises(delivery.DeliveryError):
-            delivery.deployment_config(config)
-        for ownership in ({}, None, {'subdomain': 'foreign'}, {'subdomain': 'owned-fixture.workers.dev'},
-                          {'subdomain': 'owned-fixture/unsafe'}, {'subdomain': 'Owned-fixture'}):
+        self.assertEqual(result['assets']['binding'], 'ASSETS')
+        self.assertIs(result['assets']['run_worker_first'], True)
+        self.assertNotIn('r2_buckets', result)
+        for mutation in ({'run_worker_first': False}, {'run_worker_first': ['/v1/*', '!/_private/*']},
+                         {'not_found_handling': 'single-page-application'}, {'html_handling': 'auto-trailing-slash'},
+                         {'redirects': '/public'}):
+            bad = dict(result, assets=dict(result['assets'], **mutation))
+            with self.assertRaises(delivery.DeliveryError):delivery.validate_deployment_config(bad)
+        for field, value in (('routes', [{'pattern': '*', 'fail_open': True}]), ('preview_urls', True), ('workers_dev', False)):
+            with self.assertRaises(delivery.DeliveryError):delivery.validate_deployment_config(dict(result, **{field: value}))
+        for ownership in ({}, None, {'subdomain': 'foreign'}, {'subdomain': 'owned-fixture/unsafe'}):
             with patch.object(api, 'api', return_value=ownership), self.assertRaises(delivery.DeliveryError):
                 delivery.deployment_config(config, api)
-        for host in ('other.owned-fixture.workers.dev', 'alias.monitor.owned-fixture.workers.dev',
-                     'monitor.foreign.workers.dev', 'workers.dev'):
+        with self.assertRaises(delivery.DeliveryError):delivery.deployment_config(config)
+        for host in ('other.owned-fixture.workers.dev', 'alias.monitor.owned-fixture.workers.dev', 'download.example.invalid'):
             with patch.object(api, 'api', return_value={'subdomain': 'owned-fixture'}), self.assertRaises(delivery.DeliveryError):
                 delivery.deployment_config(dict(config, origin='https://' + host), api)
-        with patch.object(api, 'api', side_effect=delivery.DeliveryError('Provider unavailable.')), self.assertRaises(delivery.DeliveryError):
-            delivery.deployment_config(config, api)
 
-    def test_workers_dev_config_is_explicit_and_ownership_failure_precedes_writes(self):
-        config = dict(origin='https://monitor.owned-fixture.workers.dev', worker_name='monitor',
-                      account_id='a' * 32, database_name='fixture', database_id='b' * 36,
-                      bucket_name='fixture', wrangler='/fixture/wrangler')
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder).resolve()
-            binary = root / 'fixture-wrangler'
-            binary.write_text('not executed')
-            config['wrangler'] = str(binary)
-            filename = root / 'owner.json'
-            delivery.private_write(filename, config)
-            self.assertEqual(delivery.load_config(filename), config)
-        api = MagicMock()
-        api.api.return_value = {'subdomain': 'foreign-account'}
-        with patch.object(delivery, 'load_config', return_value=config), patch.object(delivery, 'Cloudflare', return_value=api), patch.object(delivery.sys, 'argv', ['delivery.py', '--config', '/unused/owner.json', 'deploy']), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(delivery.main(), 1)
-        api.api.assert_called_once_with('/workers/subdomain')
-        api.query.assert_not_called()
-        api.wrangler.assert_not_called()
+    def test_active_version_including_zero_percent_and_provider_source_readback(self):
+        config = self.api.config
+        api = delivery.Cloudflare.__new__(delivery.Cloudflare);api.config = config
+        version = '12345678-1234-1234-1234-123456789abc'
+        with patch.object(api, 'api', return_value={'subdomain': 'owned-fixture'}):
+            configured = delivery.deployment_config(config, api)
+        state = dict(schema='machine-monitor/private-deployment/v1',account_id=config['account_id'],worker_name=config['worker_name'],
+                     version_id=version,etag='reviewed-etag',source_sha256=delivery.source_digest(),config=configured,assets={})
+        delivery.private_write(config['deployment_state'],state)
+        responses = {'/workers/subdomain': {'subdomain': 'owned-fixture'},
+                     '/workers/scripts/monitor/deployments': {'deployments': [{'versions': [{'version_id': version, 'percentage': 100}]}]},
+                     '/workers/scripts/monitor/versions/' + version: {'resources': {'script': {'etag': 'reviewed-etag'}}},
+                     '/workers/scripts/monitor/subdomain': {'enabled': True, 'previews_enabled': False}, '/workers/domains': []}
+        with patch.object(api, 'zone_routes', return_value=[]), patch.object(api,'api',side_effect=lambda path: responses[path]):delivery.audit_deployment(api)
+        negatives = [('/workers/scripts/monitor/deployments', {'deployments': [{'versions': [{'version_id': version,'percentage':100},{'version_id':'unsafe','percentage':0}]}]}),
+                     ('/workers/scripts/monitor/deployments', {'deployments': []}),
+                     ('/workers/scripts/monitor/versions/' + version, {'resources': {'script': {'etag': 'changed'}}}),
+                     ('/workers/scripts/monitor/subdomain', {'enabled': True,'previews_enabled': True}),
+                     ('/workers/domains', [{'service':'monitor','hostname':'unsafe.invalid'}])]
+        for path, bad in negatives:
+            changed = dict(responses, **{path: bad})
+            with patch.object(api, 'zone_routes', return_value=[]), patch.object(api,'api',side_effect=lambda key: changed[key]), self.assertRaises(delivery.DeliveryError):
+                delivery.audit_deployment(api)
 
-    def test_custom_domain_deployment_disables_workers_dev_without_ownership_read(self):
-        config = dict(origin='https://download.example.invalid', worker_name='monitor',
-                      account_id='a' * 32, database_name='fixture', database_id='b' * 36,
-                      bucket_name='fixture', wrangler='/fixture/wrangler')
-        api = delivery.Cloudflare.__new__(delivery.Cloudflare)
-        with patch.object(api, 'api', side_effect=AssertionError('Custom hostname needs no workers.dev read')):
-            result = delivery.deployment_config(config, api)
-        self.assertFalse(result['workers_dev'])
-        self.assertFalse(result['preview_urls'])
-        self.assertEqual(result['routes'], [{'pattern': 'download.example.invalid', 'custom_domain': True}])
-        self.assertEqual(result['vars']['UPDATE_ORIGIN'], config['origin'])
+    def test_existing_worker_with_lost_receipt_cannot_be_replaced(self):
+        api = delivery.Cloudflare.__new__(delivery.Cloudflare);api.config=self.api.config
+        def response(path, **kwargs):
+            return {'subdomain':'owned-fixture'} if path == '/workers/subdomain' else {'deployments':[]}
+        with patch.object(api,'api',side_effect=response), patch.object(api,'query') as query, patch.object(api,'wrangler') as wrangler:
+            with self.assertRaises(delivery.DeliveryError):api.deploy()
+            query.assert_not_called();wrangler.assert_not_called()
+
+    def test_zone_routes_are_exhaustive_read_only_and_fail_closed(self):
+        api = delivery.Cloudflare.__new__(delivery.Cloudflare);api.config=self.api.config
+        zone = 'f' * 32
+        with patch.object(api,'_zone_read',side_effect=[[{'id':zone}],[{'script':'monitor','fail_open':True}]]) as reads:
+            self.assertEqual(api.zone_routes()[0]['script'],'monitor')
+            self.assertEqual(reads.call_count,2)
+        with patch.object(api,'_zone_read',return_value=None), self.assertRaises(delivery.DeliveryError):api.zone_routes()
+        for path in ('/zones/foreign/workers/routes', '/zones?account.id=foreign', '/subscriptions'):
+            with self.assertRaises(delivery.DeliveryError):api._zone_read(path)
+
+    def test_private_assets_bounded_immutable_retained_and_no_routing_files(self):
+        root = Path(self.api.config['assets_directory'])
+        source = self.api.root / 'large.zip'
+        data = b'x' * delivery.PART_SIZE + b'y' * 17
+        source.write_bytes(data)
+        desc = {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+        parts = delivery.stage_artifact(self.api.config, source, 'fixture-1', 'archive', desc)
+        self.assertEqual([p['size'] for p in parts], [delivery.PART_SIZE, 17])
+        self.assertEqual(len(delivery.asset_inventory(self.api.config)),2)
+        api = delivery.Cloudflare.__new__(delivery.Cloudflare);api.config = self.api.config
+        rows = [{'parts_json':json.dumps(parts)}]
+        with patch.object(api,'query',return_value=rows):
+            api.preflight_retention(delivery.asset_inventory(self.api.config))
+            (root / parts[0]['path'].lstrip('/')).unlink()
+            with self.assertRaises(delivery.DeliveryError):api.preflight_retention(delivery.asset_inventory(self.api.config))
+        for name in ('_headers','_redirects','index.html','secret.json'):
+            path = root / name;path.write_text('forbidden');path.chmod(0o600)
+            with self.assertRaises(delivery.DeliveryError):delivery.asset_inventory(self.api.config)
+            path.unlink()
+        link = root / 'link';link.symlink_to(source)
+        with self.assertRaises(delivery.DeliveryError):delivery.asset_inventory(self.api.config)
+        link.unlink()
+
+    def test_readback_failure_never_advances_channel_and_stable_cannot_replace_bytes(self):
+        value = release()
+        artifact = self.api.root / 'artifact.zip';artifact.write_bytes(b'test')
+        with patch.object(self.api,'readback',side_effect=delivery.DeliveryError('Synthetic readback failure')):
+            with self.assertRaises(delivery.DeliveryError):delivery.publish(self.api,value,receipt(value),artifact,artifact)
+        self.assertEqual(self.api.query('SELECT * FROM channels'), [])
+        self.assertEqual(len(self.api.query('SELECT * FROM releases')),1)
+        delivery.publish(self.api,value,receipt(value),artifact,artifact)
+        stable = dict(value, channel='stable',qualified=True);proof=receipt(stable);proof['checks']['private_upgrade']=True
+        with self.assertRaises(delivery.DeliveryError):delivery.publish(self.api,stable,proof,artifact,artifact)
 
     def test_pinned_wrangler_auth_is_captured_without_argv_secrets(self):
         secret = 'fixture-owner-token'
@@ -272,7 +377,7 @@ class ChannelTests(unittest.TestCase):
             if args[-1] == '--version':
                 return subprocess.CompletedProcess(args, 0, b'4.158.0\n', b'')
             return subprocess.CompletedProcess(args, 0, json.dumps({'type': 'oauth', 'token': secret}).encode(), b'')
-        with patch.object(delivery.subprocess, 'run', side_effect=fake):
+        with patch.object(delivery, 'pinned_node', return_value='/fixture/node'), patch.object(delivery.subprocess, 'run', side_effect=fake):
             api = delivery.Cloudflare({'wrangler': '/fixture/wrangler'})
         self.assertEqual(api._authorization, 'Bearer ' + secret)
         for args, kwargs in seen:

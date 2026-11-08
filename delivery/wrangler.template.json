@@ -4,9 +4,30 @@
   "compatibility_date": "2026-11-07",
   "workers_dev": false,
   "preview_urls": false,
-  "observability": {"enabled": false},
-  "routes": [{"pattern": "OWNER_APPROVED_DOWNLOAD_HOST", "custom_domain": true}],
-  "vars": {"UPDATE_ORIGIN": "https://OWNER_APPROVED_DOWNLOAD_HOST"},
-  "d1_databases": [{"binding": "DB", "database_name": "OWNER_PRIVATE_DATABASE_NAME", "database_id": "OWNER_PRIVATE_DATABASE_ID"}],
-  "r2_buckets": [{"binding": "ARCHIVES", "bucket_name": "OWNER_PRIVATE_BUCKET_NAME"}]
+  "observability": {
+    "enabled": false
+  },
+  "routes": [
+    {
+      "pattern": "OWNER_APPROVED_DOWNLOAD_HOST",
+      "custom_domain": true
+    }
+  ],
+  "vars": {
+    "UPDATE_ORIGIN": "https://OWNER_APPROVED_DOWNLOAD_HOST"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "OWNER_PRIVATE_DATABASE_NAME",
+      "database_id": "OWNER_PRIVATE_DATABASE_ID"
+    }
+  ],
+  "assets": {
+    "directory": "OWNER_CANONICAL_PRIVATE_ASSET_DIRECTORY",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "html_handling": "none",
+    "not_found_handling": "none"
+  }
 }
