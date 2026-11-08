@@ -14,6 +14,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
 from urllib.parse import urlsplit
@@ -288,15 +289,25 @@ def evaluate(frames, cfg):
     return dict(health=round(min(factors.values())) if len(factors)==3 else None,headroom=headroom,
                 coverage=f'{len(factors)}/3 health domains · temperature / GPU not scored',alerts=alerts,factors=factors)
 
+class InstallationBusyError(ValueError):
+    """Collection cannot begin after an update has acquired admission."""
+
+
+class InstallAdmissionError(ValueError):
+    """An active collector or another installer owns the admission boundary."""
+
+
 class Engine:
     def __init__(self, factory=Collector, clock=time.monotonic):
         self.lock=threading.RLock(); self.wake=threading.Event(); self.factory=factory; self.clock=clock
         self.active=False; self.scan=None; self.frames=[]; self.config=dict(DEFAULTS); self.reason='Not started'
         self.deadline=0; self.lease=0; self.cancel=threading.Event(); self.collections=0
         self.worker=None
+        self.install_token=None; self.install_transaction=None
 
     def start(self,duration,config=None):
         with self.lock:
+            if self.install_token is not None: raise InstallationBusyError('Update installation is in progress')
             if self.active: raise ValueError('A scan is already active')
             if self.worker and self.worker.is_alive(): raise ValueError('Previous collector is stopping')
             if duration not in (1.5,30,60): raise ValueError('Choose snapshot, 30 or 60 seconds')
@@ -311,6 +322,32 @@ class Engine:
             self.worker=threading.Thread(target=self._loop,args=(self.scan,self.cancel),daemon=True,name='bounded-scan')
             self.worker.start()
             return self.scan
+
+    def admit_install(self, transaction):
+        """Atomically exclude all scan starts, including already queued requests.
+
+        The transaction makes a lost admission response safe to retry. Admission
+        never expires on a timer: only a verified abort or service shutdown can
+        hand collection back to the caller.
+        """
+        if not isinstance(transaction, str): raise ValueError('Transaction UUID required')
+        transaction=uuid.UUID(transaction).hex
+        with self.lock:
+            if self.install_token is not None:
+                if self.install_transaction==transaction: return self.install_token
+                raise InstallAdmissionError('Another update installation is in progress')
+            if self.active or (self.worker is not None and self.worker.is_alive()):
+                raise InstallAdmissionError('Wait for the current collector to finish')
+            self.install_token=secrets.token_urlsafe(32); self.install_transaction=transaction
+            self.reason='Update installation admitted'
+            return self.install_token
+
+    def release_install(self, token):
+        """Called by the native owner only after it proves no installer is pending."""
+        with self.lock:
+            if not isinstance(token,str) or self.install_token is None or not secrets.compare_digest(self.install_token,token):
+                raise InstallAdmissionError('Installation lease does not match')
+            self.install_token=None; self.install_transaction=None; self.reason='Update installation cancelled'
 
     def valid(self,scan):
         return self.active and scan==self.scan and self.clock()<min(self.deadline,self.lease)
@@ -350,7 +387,8 @@ class Engine:
             if self.active and not self.valid(self.scan): self.stop('Scan complete' if self.clock()>=self.deadline else 'Visibility lease expired')
             return dict(active=self.active,scan=self.scan,reason=self.reason,remaining=max(0,self.deadline-self.clock()) if self.active else 0,
                 frames=self.frames[max(0,after+1):],count=len(self.frames),summary=evaluate(self.frames,self.config),config=dict(self.config),
-                collections=self.collections,lease_seconds=3,service_pid=os.getpid())
+                collections=self.collections,lease_seconds=3,service_pid=os.getpid(),
+                installing=self.install_token is not None,installation_transaction=self.install_transaction)
 
 class Handler(BaseHTTPRequestHandler):
     server_version='MachineMonitor/1'
@@ -391,10 +429,20 @@ class Handler(BaseHTTPRequestHandler):
             if path=='/api/start': self.server.engine.start(body.get('duration'),body.get('config'))
             elif path=='/api/tick': self.server.engine.renew(body.get('scan'))
             elif path=='/api/stop': self.server.engine.stop(scan=body.get('scan'))
+            elif path=='/api/install-admit':
+                if not getattr(self.server,'desktop',False): return self.reply(404,{'error':'Not found'})
+                token=self.server.engine.admit_install(body.get('transaction'))
+                return self.reply(200,{**self.server.engine.state(), 'install_lease':token})
+            elif path=='/api/install-release':
+                if not getattr(self.server,'desktop',False): return self.reply(404,{'error':'Not found'})
+                self.server.engine.release_install(body.get('install_lease'))
             elif path=='/api/shutdown':
                 self.server.engine.stop('Service stopped'); threading.Thread(target=self.server.shutdown,daemon=True).start()
             else: return self.reply(404,{'error':'Not found'})
             return self.reply(200,self.server.engine.state(body.get('after',-1)))
+        except InstallationBusyError: return self.reply(423,{'error':'Update installation is in progress. Start a scan after the app restarts.'})
+        except InstallAdmissionError: return self.reply(409,{
+            **self.server.engine.state(), 'error':'Collection or another installation owns admission'})
         except (ValueError,TypeError): return self.reply(400,{'error':'Invalid request or a scan is already active'})
 
 class LoopbackHTTPServer(ThreadingHTTPServer):
@@ -409,7 +457,21 @@ def main():
     parser=argparse.ArgumentParser(); parser.add_argument('--port',type=int,default=8766)
     parser.add_argument('--desktop',action='store_true')
     parser.add_argument('--parent-pid',type=int)
+    parser.add_argument('--install-transaction',help='Keep a validated update adoption dormant until native acceptance')
+    modes=parser.add_mutually_exclusive_group()
+    modes.add_argument('--update-preflight',action='store_true')
+    modes.add_argument('--update-recovery',action='store_true')
     args=parser.parse_args()
+    if args.update_preflight or args.update_recovery:
+        if args.desktop or args.parent_pid is not None or args.install_transaction is not None or args.port!=8766:
+            parser.error('Update helper modes cannot start a collector service')
+        if args.update_preflight:
+            from update_preflight import main as update_main
+        else:
+            from update_recovery import main as update_main
+        return update_main()
+    if args.install_transaction is not None and (not args.desktop or args.parent_pid is None):
+        parser.error('An update adoption requires the native lifetime owner')
     if args.parent_pid is not None and args.parent_pid!=os.getppid():
         parser.error('The lifetime owner must be the launching parent process')
     parent_watch=None
@@ -418,7 +480,11 @@ def main():
         parent_watch.control([select.kevent(args.parent_pid,filter=select.KQ_FILTER_PROC,
             flags=select.KQ_EV_ADD|select.KQ_EV_ONESHOT,fflags=select.KQ_NOTE_EXIT)],0,0)
     server=LoopbackHTTPServer(('127.0.0.1',args.port),Handler)
-    server.token=secrets.token_urlsafe(32); server.engine=Engine()
+    server.token=secrets.token_urlsafe(32); server.engine=Engine(); server.desktop=args.desktop
+    startup_lease=None
+    if args.install_transaction is not None:
+        try: startup_lease=server.engine.admit_install(args.install_transaction)
+        except ValueError: server.server_close(); parser.error('Invalid update transaction')
     def shutdown(*_):
         server.engine.stop('App closed')
         threading.Thread(target=server.shutdown,daemon=True).start()
@@ -430,7 +496,9 @@ def main():
             except (OSError,ValueError): pass
         threading.Thread(target=watch_parent,daemon=True,name='app-lifetime').start()
     if args.desktop:
-        print('MACHINE_MONITOR_READY '+json.dumps(dict(port=server.server_port,pid=os.getpid())),flush=True)
+        readiness=dict(port=server.server_port,pid=os.getpid())
+        if startup_lease is not None: readiness['install_lease']=startup_lease
+        print('MACHINE_MONITOR_READY '+json.dumps(readiness),flush=True)
     else:
         print(f'Machine Monitor: http://127.0.0.1:{server.server_port} — dormant until a scan is requested',flush=True)
     try: server.serve_forever()
@@ -444,4 +512,4 @@ def main():
         server.server_close()
         if parent_watch is not None: parent_watch.close()
 
-if __name__=='__main__': main()
+if __name__=='__main__': raise SystemExit(main())

@@ -5,7 +5,7 @@ const bytes=n=>n==null?'—':n>=GB?fmt(n/GB)+' GiB':fmt(n/MB)+' MiB';
 const pct=n=>n==null?'Baseline':fmt(n)+'%';
 const celsius=n=>n==null?'Unavailable':fmt(n)+'°C';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let frames=[], scan=null, active=false, timer=null, hover=null, selected=null, summary={}, config={}, nextConfig=null, sorts={cpu:'cpu',memory:'rss'}, lastState=null, starting=false;
+let frames=[], scan=null, active=false, timer=null, hover=null, selected=null, summary={}, config={}, nextConfig=null, sorts={cpu:'cpu',memory:'rss'}, lastState=null, starting=false, installing=false;
 let completionTimer=null, requestGeneration=0;
 const expanded={cpu:new Set(),memory:new Set()}, observationCache=new WeakMap();
 function observation(f,id){if(!observationCache.has(f))observationCache.set(f,new Map([...f.processes,...(f.process_groups||[])].map(p=>[p.id,p])));return observationCache.get(f).get(id);}
@@ -14,7 +14,7 @@ function detail(id, rows){$(id).innerHTML=rows.map(([k,v])=>`<div class="detail"
 async function api(path,body){const response=await fetch('/api/'+path,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json','X-Monitor':'1'}:{},body:body?JSON.stringify(body):undefined,signal:AbortSignal.timeout(2500)});const result=await response.json();if(!response.ok)throw Error(result.error||'Local service unavailable');return result;}
 function fail(message){$('error').hidden=false;$('error').textContent=message;}
 function clearError(){$('error').hidden=true;}
-function scanControls(){const busy=active||starting;$('start').disabled=busy;$('snapshot').disabled=busy;$('duration').disabled=busy;$('stop').hidden=!active;$('start').textContent=`Start ${$('duration').value}-second scan`;}
+function scanControls(){const busy=active||starting||installing;$('start').disabled=busy;$('snapshot').disabled=busy;$('duration').disabled=busy;$('stop').hidden=!active;$('start').textContent=installing?'Installing update…':`Start ${$('duration').value}-second scan`;}
 function cancelScanTimers(){clearTimeout(timer);clearTimeout(completionTimer);timer=null;completionTimer=null;}
 function finishLocally(reason){cancelScanTimers();active=false;starting=false;status({...lastState,active:false,remaining:0,reason,count:frames.length});}
 async function completeScan(expectedScan,generation){
@@ -23,16 +23,16 @@ async function completeScan(expectedScan,generation){
  // Fetch final observations once; completion never depends on this request succeeding.
  try{const s=await api('state');if(finalGeneration===requestGeneration&&!starting&&s.scan===expectedScan)accept(s,true);}catch{}
 }
-function status(s){lastState=s;active=s.active;scan=s.scan;summary=s.summary;config=s.config;
- $('state').textContent=active?'Scanning':s.count?'Dormant · last scan':'Dormant';$('statusDot').classList.toggle('live',active);
+function status(s){lastState=s;active=s.active;installing=Boolean(s.installing);scan=s.scan;summary=s.summary;config=s.config;
+ $('state').textContent=installing?'Installing update':active?'Scanning':s.count?'Dormant · last scan':'Dormant';$('statusDot').classList.toggle('live',active);
  scanControls();clearTimeout(completionTimer);completionTimer=null;
  if(active){const expectedScan=scan,generation=requestGeneration;completionTimer=setTimeout(()=>completeScan(expectedScan,generation),Math.max(0,s.remaining*1000)+25);}
  $('timer').textContent=active?`${Math.ceil(s.remaining)}s remaining · ~1s samples`:s.count?`${s.reason} · ${s.count} observations retained`:'Collection runs only while viewed.';
- $('start').textContent=`Start ${$('duration').value}-second scan`;
+ $('start').textContent=installing?'Installing update…':`Start ${$('duration').value}-second scan`;
 }
 function accept(s,replace=false){if(replace||s.scan!==scan){frames=[];hover=null;}if(s.frames?.length)frames.push(...s.frames);frames=frames.slice(-61);status(s);render();}
 async function tick(){if(!active||document.hidden)return;const generation=requestGeneration,expectedScan=scan;try{const s=await api('tick',{scan:expectedScan,after:frames.length-1});if(generation!==requestGeneration||!active)return;accept(s);if(active&&!document.hidden)timer=setTimeout(tick,1000);}catch(e){if(generation!==requestGeneration)return;++requestGeneration;finishLocally('Connection lost');$('state').textContent='Disconnected';fail('Local connection lost. Collection expires within 3 seconds. Start another scan after the service is available.');}}
-async function start(duration){if(active||starting||document.hidden)return;const generation=++requestGeneration;cancelScanTimers();starting=true;scanControls();clearError();try{const s=await api('start',{duration,config:nextConfig||config});if(generation!==requestGeneration){if(s.active)fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor':'1'},body:JSON.stringify({scan:s.scan}),keepalive:true}).catch(()=>{});return;}accept(s,true);if(active)timer=setTimeout(tick,500);}catch(e){if(generation===requestGeneration){finishLocally('Scan could not start');fail(e.message);}}finally{if(generation===requestGeneration){starting=false;scanControls();}}}
+async function start(duration){if(active||starting||installing||document.hidden)return;const generation=++requestGeneration;cancelScanTimers();starting=true;scanControls();clearError();try{const s=await api('start',{duration,config:nextConfig||config});if(generation!==requestGeneration){if(s.active)fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor':'1'},body:JSON.stringify({scan:s.scan}),keepalive:true}).catch(()=>{});return;}accept(s,true);if(active)timer=setTimeout(tick,500);}catch(e){if(generation===requestGeneration){finishLocally('Scan could not start');fail(e.message);}}finally{if(generation===requestGeneration){starting=false;scanControls();}}}
 async function stop(reason){const generation=++requestGeneration,expectedScan=scan;cancelScanTimers();active=false;starting=true;scanControls();try{const s=await api('stop',{scan:expectedScan,after:frames.length-1});if(generation===requestGeneration)accept(s);}catch(e){if(generation===requestGeneration){finishLocally('Stopped locally');fail('Stop could not reach the service. The backend visibility lease expires within 3 seconds.');}}finally{if(generation===requestGeneration){starting=false;scanControls();}}}
 function leave(){if(!active&&!starting)return;const expectedScan=starting?null:scan;++requestGeneration;finishLocally('Stopped while hidden');fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor':'1'},body:JSON.stringify({scan:expectedScan}),keepalive:true}).catch(()=>{});$('state').textContent='Dormant · hidden';}
 document.addEventListener('visibilitychange',()=>{if(document.hidden)leave();else api('state').then(s=>accept(s,true)).catch(()=>fail('Local service is offline.'));});

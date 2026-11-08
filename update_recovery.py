@@ -419,6 +419,18 @@ class RecoveryStore:
                 return self._resume(restore,journal)
             if restore and restore['transaction_id']==transaction and restore['phase']=='accepted':
                 return self._resume(restore,journal)
+            if restore and restore['transaction_id']==transaction and restore['phase']=='rolled-back':
+                stage,saved=self._recovery_paths(transaction)
+                if restore['backup']!=backup or saved.exists() or saved.is_symlink():
+                    raise UpdateError('Rolled-back restoration authority changed')
+                self._matches(self.target,restore['old'])
+                if stage.is_symlink() or not stage.is_dir() or stage.stat().st_uid!=os.getuid() or stage.stat().st_ino!=restore.get('stage_inode'):
+                    raise UpdateError('Rolled-back restoration staging identity changed')
+                self._matches(stage,backup)
+                # Reuse only the durably recorded, independently verified stage.
+                # Persist the retry before either rename; no existing path is discarded.
+                self._phase(restore,'prepared')
+                return self._resume(restore,journal)
             canonical_target(self.target)
             try:
                 current=self.inspect(self.target)

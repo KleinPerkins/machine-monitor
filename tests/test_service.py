@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import unittest
+import uuid
 from unittest.mock import patch
 
 import monitor
@@ -18,6 +19,7 @@ class FixtureServiceTests(unittest.TestCase):
         self.server = monitor.LoopbackHTTPServer(('127.0.0.1', 0), monitor.Handler)
         self.server.token = 'synthetic-session-token'
         self.server.engine = monitor.Engine(factory=SyntheticCollector)
+        self.server.desktop = True
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval': .02})
         self.thread.start()
         self.addCleanup(self.close)
@@ -135,6 +137,88 @@ class FixtureServiceTests(unittest.TestCase):
             self.assertEqual(self.request('/api/start', body)[0], 400)
         self.assertEqual(self.server.engine.collections, 0)
         self.assertFalse(self.server.engine.active)
+
+    def test_install_admission_is_desktop_and_session_protected(self):
+        transaction = str(uuid.uuid4())
+        self.assertEqual(self.request('/api/install-admit', {'transaction': transaction}, authorized=False)[0], 403)
+        self.server.desktop = False
+        self.assertEqual(self.request('/api/install-admit', {'transaction': transaction})[0], 404)
+        self.assertFalse(self.api('state')['installing'])
+        self.server.desktop = True
+        for value in (None, 1, '', 'not-a-uuid'):
+            self.assertEqual(self.request('/api/install-admit', {'transaction': value})[0], 400)
+
+    def test_install_lease_is_idempotent_private_and_does_not_expire(self):
+        transaction = str(uuid.uuid4())
+        admitted = self.api('install-admit', {'transaction': transaction})
+        self.assertTrue(admitted['installing'])
+        token = admitted['install_lease']
+        self.assertEqual(self.api('install-admit', {'transaction': transaction})['install_lease'], token)
+        self.assertEqual(self.request('/api/install-admit', {'transaction': str(uuid.uuid4())})[0], 409)
+        self.assertNotIn('install_lease', self.api('state'))
+        self.assertNotIn(token, json.dumps(self.api('state')))
+        self.server.engine.clock = lambda: 10**12
+        self.assertTrue(self.api('state')['installing'])
+        self.api('stop', {})
+        self.assertTrue(self.api('state')['installing'])
+        for wrong in (None, '', 'wrong-lease'):
+            self.assertEqual(self.request('/api/install-release', {'install_lease': wrong})[0], 409)
+        self.api('install-release', {'install_lease': token})
+        self.assertFalse(self.api('state')['installing'])
+        newer = self.api('install-admit', {'transaction': str(uuid.uuid4())})
+        self.assertNotEqual(newer['install_lease'], token)
+        self.assertEqual(self.request('/api/install-release', {'install_lease': token})[0], 409)
+        self.assertTrue(self.api('state')['installing'])
+
+    def test_active_scan_and_stopping_collector_prevent_install_admission(self):
+        self.api('start', {'duration': 30})
+        self.assertEqual(self.request('/api/install-admit', {'transaction': str(uuid.uuid4())})[0], 409)
+        self.api('stop', {})
+        self.server.engine.worker.join(2)
+        self.assertFalse(self.server.engine.worker.is_alive())
+        with patch.object(self.server.engine.worker, 'is_alive', return_value=True):
+            self.assertEqual(self.request('/api/install-admit', {'transaction': str(uuid.uuid4())})[0], 409)
+        admitted = self.api('install-admit', {'transaction': str(uuid.uuid4())})
+        for duration in (1.5, 30, 60):
+            self.assertEqual(self.request('/api/start', {'duration': duration})[0], 423)
+        self.assertFalse(self.api('state')['active'])
+        self.api('install-release', {'install_lease': admitted['install_lease']})
+        self.assertTrue(self.api('start', {'duration': 30})['active'])
+
+    def test_scan_start_and_install_admission_have_one_atomic_winner(self):
+        for _ in range(30):
+            engine = monitor.Engine(factory=SyntheticCollector)
+            gate = threading.Barrier(3)
+            results = []
+            def start():
+                gate.wait()
+                try:
+                    engine.start(30)
+                    results.append('scan')
+                except ValueError:
+                    pass
+            def install():
+                gate.wait()
+                try:
+                    engine.admit_install(str(uuid.uuid4()))
+                    results.append('install')
+                except ValueError:
+                    pass
+            threads = [threading.Thread(target=start), threading.Thread(target=install)]
+            try:
+                for thread in threads:
+                    thread.start()
+                gate.wait(timeout=2)
+                for thread in threads:
+                    thread.join(2)
+                    self.assertFalse(thread.is_alive())
+                self.assertEqual(len(results), 1, results)
+                self.assertFalse(engine.active and engine.install_token is not None)
+            finally:
+                engine.stop()
+                if engine.worker is not None:
+                    engine.worker.join(2)
+                    self.assertFalse(engine.worker.is_alive())
 
 
 if __name__ == '__main__':

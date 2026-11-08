@@ -236,6 +236,9 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(verifier(self.target)['build'],2)
         self.assertTrue(Path(prepared['backup']['path']).exists())
         self.assertEqual(recovery.load_json(self.store.state/'recovery.json')['phase'],'rolled-back')
+        result=self.store.restore(prepared['transaction_id'])
+        self.assertEqual(result['restored']['build'],1)
+        self.assertTrue(Path(prepared['backup']['path']).exists())
 
     def test_tampered_backup_journal_path_and_permissions(self):
         prepared=self.prepare()

@@ -279,7 +279,7 @@ class ChannelTests(unittest.TestCase):
             self.assertNotIn(secret, repr(args))
             self.assertEqual(kwargs['env']['WRANGLER_SEND_METRICS'], 'false')
             self.assertEqual(kwargs['env']['WRANGLER_WRITE_LOGS'], 'false')
-            self.assertEqual(kwargs['env']['WRANGLER_LOG'], 'none')
+            self.assertEqual(kwargs['env']['WRANGLER_LOG'], 'log')
             self.assertEqual(kwargs['env']['WRANGLER_LOG_SANITIZE'], 'true')
             self.assertEqual(kwargs['env']['WRANGLER_SEND_ERROR_REPORTS'], 'false')
             self.assertEqual(kwargs['env']['CLOUDFLARE_API_BASE_URL'], 'https://api.cloudflare.com/client/v4')

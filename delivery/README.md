@@ -64,7 +64,7 @@ must be preinstalled at exactly **4.158.0**; Node must be exactly **26.4.0**
 The CLI captures `wrangler auth token --json` directly into process memory using
 the original owner HOME/auth context and refresh behavior. It never displays or
 persists that output, never puts credentials in argv, suppresses upstream raw
-output, rejects API redirects and disables Wrangler disk logs, metrics, error reports and Worker observability. It clears inherited output-file overrides, enforces log sanitization and the official API base, and uses the explicitly configured account. Pinned Wrangler's JSON logger writes only the captured stdout, independently of disabled ordinary logging.
+output, rejects API redirects and disables Wrangler disk logs, metrics, error reports and Worker observability. It clears inherited output-file overrides, enforces log sanitization and the official API base, and uses the explicitly configured account. The normal log level is retained because this pinned Wrangler also suppresses machine-readable version/authentication output at quieter levels. All stdout and stderr remain captured in the owner process and are never forwarded; disk logging and telemetry remain disabled.
 It supports OAuth/API-token auth; global API-key/email auth is refused. Only the
 normal Cloudflare API origin receives the owner credential. The CLI is never
 executed by the public UI, Worker or recipient applications.

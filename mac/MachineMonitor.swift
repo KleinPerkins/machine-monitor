@@ -21,10 +21,32 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     var verifyPath: String?
     var verification: [String: Any] = [:]
     var verificationStarted = false
+    var updates: UpdateCoordinator?
+    var startupInstallLease: String?
+    var updateScheduleStarted = false
+    var pendingAccessFiles: [URL] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--verify"), args.count > i + 1 { verifyPath = args[i + 1] }
+        updates = UpdateCoordinator.bootstrap()
+        if updates?.startupDisposition == .locked { NSApp.terminate(nil); return }
+        if let i = args.firstIndex(of: "--import-access-file"), args.count > i + 1 {
+            pendingAccessFiles.append(URL(fileURLWithPath: args[i + 1]))
+        }
+        updates?.admitInstall = { [weak self] transaction, completion in
+            guard let self else { completion(.unavailable); return }
+            self.requestInstallAdmission(transaction, completion: completion)
+        }
+        updates?.releaseInstall = { [weak self] token, completion in
+            guard let self else { completion(false); return }
+            self.releaseInstallAdmission(token, completion: completion)
+        }
+        updates?.isVisible = { [weak self] in
+            guard let self else { return false }
+            return NSApp.isActive && self.window?.isVisible == true && self.window?.isMiniaturized == false && self.window?.occlusionState.contains(.visible) == true
+        }
+        updates?.onStateChange = { [weak self] in self?.updateStateChanged() }
         NSApp.setActivationPolicy(.regular)
         buildMenu()
         let configuration = WKWebViewConfiguration()
@@ -76,6 +98,9 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         startService()
+        let accessFiles = pendingAccessFiles
+        pendingAccessFiles.removeAll()
+        for file in accessFiles { updates?.importAccessFile(file) }
         if verifyPath != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 65) { [weak self] in
                 self?.verificationFailed("Native acceptance check timed out")
@@ -83,11 +108,20 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
 
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        guard filenames.count == 1 else { sender.reply(toOpenOrPrint: .failure); return }
+        let url = URL(fileURLWithPath: filenames[0])
+        if let updates { updates.importAccessFile(url) }
+        else { pendingAccessFiles.append(url) }
+        sender.reply(toOpenOrPrint: .success)
+    }
+
     func buildMenu() {
         let menu = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu(title: "Machine Monitor")
         appMenu.addItem(withTitle: "About Machine Monitor", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        updates?.appendMenu(to: appMenu)
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide Machine Monitor", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
@@ -125,9 +159,13 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     func startService() {
         guard service?.isRunning != true else { return }
+        guard updates?.allowsCollectorService != false else {
+            presentMessage(updates?.status ?? "Update recovery is required.", canRetry: false); return
+        }
         generation += 1
         let expected = generation
         loaded = false
+        startupInstallLease = nil
         origin = nil
         readyBytes = Data()
         serviceLog = ""
@@ -138,6 +176,9 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let child = Process()
         child.executableURL = resource.appendingPathComponent("service/monitor-service")
         child.arguments = ["--port", "0", "--desktop", "--parent-pid", String(getpid())]
+        if let transaction = updates?.startupInstallTransactionID {
+            child.arguments?.append(contentsOf: ["--install-transaction", transaction])
+        }
         // No inherited Python paths, environment secrets or shell are needed by the frozen service.
         child.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8"]
         child.currentDirectoryURL = resource
@@ -164,7 +205,11 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
             DispatchQueue.main.async {
                 guard let self, self.generation == expected, !self.quitting else { return }
                 self.loaded = false
-                self.presentMessage("The local monitor stopped. Click Try again to reopen it.", canRetry: true)
+                if self.updates?.allowsCollectorService == false {
+                    self.presentMessage(self.updates?.status ?? "An update is in progress.", canRetry: false)
+                } else {
+                    self.presentMessage("The local monitor stopped. Click Try again to reopen it.", canRetry: true)
+                }
                 if self.verifyPath != nil { self.verificationFailed("Service exited: \(process.terminationStatus): \(self.serviceLog)") }
             }
         }
@@ -190,14 +235,21 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         guard let text = String(data: readyBytes, encoding: .utf8), let end = text.firstIndex(of: "\n") else { return }
         let line = String(text[..<end]), prefix = "MACHINE_MONITOR_READY "
         guard line.hasPrefix(prefix), let json = String(line.dropFirst(prefix.count)).data(using: .utf8),
-              let value = try? JSONSerialization.jsonObject(with: json) as? [String: Int],
-              value["pid"] == Int(service!.processIdentifier), let port = value["port"], (1...65535).contains(port),
+              let value = try? JSONSerialization.jsonObject(with: json) as? [String: Any],
+              value["pid"] as? Int == Int(service!.processIdentifier), let port = value["port"] as? Int, (1...65535).contains(port),
               let url = URL(string: "http://127.0.0.1:\(port)/") else { service?.terminate(); return }
+        if updates?.startupInstallTransactionID != nil {
+            guard let lease = value["install_lease"] as? String, (32...128).contains(lease.count) else {
+                service?.terminate(); presentMessage("Update readiness could not be protected. Open Machine Monitor Recovery.", canRetry: false); return
+            }
+            startupInstallLease = lease
+        }
         origin = url
         web.load(URLRequest(url: url))
     }
 
     @objc func reloadMonitor() {
+        guard updates?.allowsCollectorService != false else { return }
         if service?.isRunning == true, let origin {
             loaded = false
             web.load(URLRequest(url: origin))
@@ -214,15 +266,66 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         if command == "quit" { NSApp.terminate(nil) }
         if command == "ready" {
             loaded = true
+            updates?.serviceReady(startupLease: startupInstallLease)
             placeholder.isHidden = true
             web.isHidden = false
             startFirstScanIfVisible()
+            startUpdateScheduleIfReady()
+        }
+    }
+
+    func updateStateChanged() {
+        guard window != nil, !quitting else { return }
+        if updates?.startupDisposition == .recovery {
+            stopWhenHidden()
+            presentMessage(updates?.status ?? "Open Machine Monitor Recovery to resolve the installation.", canRetry: false)
+        } else {
+            startFirstScanIfVisible()
+            startUpdateScheduleIfReady()
+        }
+    }
+
+    func startUpdateScheduleIfReady() {
+        guard loaded, !updateScheduleStarted, !quitting else { return }
+        let adoptedDormant = updates?.startupDisposition == .dormant && updates?.startupInstallTransactionID == nil
+        guard firstScanStarted || adoptedDormant else { return }
+        updateScheduleStarted = true
+        updates?.dashboardReady()
+    }
+
+    func requestInstallAdmission(_ transaction: String, completion: @escaping (UpdateInstallAdmission) -> Void) {
+        guard loaded, service?.isRunning == true, !quitting else { completion(.unavailable); return }
+        web.callAsyncJavaScript("""
+            try {
+                const response=await fetch('/api/install-admit',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor':'1'},body:JSON.stringify({transaction}),signal:AbortSignal.timeout(2500)});
+                const state=await response.json();
+                if(response.ok && typeof state.install_lease==='string') {accept(state,true);return {status:'admitted',lease:state.install_lease};}
+                if(response.status===409 && state.installing===false)return {status:'busy'};
+                return {status:'unavailable'};
+            } catch {return {status:'unavailable'};}
+            """, arguments: ["transaction": transaction], in: nil, in: .page) { result in
+            guard case .success(let raw) = result, let value = raw as? [String: Any] else { completion(.unavailable); return }
+            if value["status"] as? String == "admitted", let token = value["lease"] as? String {
+                completion(.admitted(token))
+            } else if value["status"] as? String == "busy" { completion(.busy) }
+            else { completion(.unavailable) }
+        }
+    }
+
+    func releaseInstallAdmission(_ token: String, completion: @escaping (Bool) -> Void) {
+        guard loaded, service?.isRunning == true, !quitting else { completion(false); return }
+        web.callAsyncJavaScript("""
+            try {const state=await api('install-release',{install_lease:token});accept(state,true);return state.installing===false;}
+            catch {return false;}
+            """, arguments: ["token": token], in: nil, in: .page) { result in
+            if case .success(let value) = result { completion(value as? Bool == true) }
+            else { completion(false) }
         }
     }
 
     func startFirstScanIfVisible() {
         guard loaded, !firstScanStarted, !firstScanRequested, NSApp.isActive, window.isVisible, !window.isMiniaturized,
-              window.occlusionState.contains(.visible), !quitting else { return }
+              window.occlusionState.contains(.visible), !quitting, updates?.suppressAutomaticScan != true else { return }
         firstScanRequested = true
         // AppKit visibility changes reach WebKit asynchronously. Wait for WebKit's
         // actual visibility before invoking the frontend's hidden-page guard.
@@ -237,6 +340,7 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
             case .success(let attempted):
                 if attempted as? Bool == true {
                     self.firstScanStarted = true
+                    self.startUpdateScheduleIfReady()
                     if self.verifyPath != nil && !self.verificationStarted {
                         self.verificationStarted = true; self.runVerification()
                     }
@@ -248,10 +352,11 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func stopWhenHidden() {
+        updates?.visibilityChanged()
         guard loaded else { return }
         web.evaluateJavaScript("leave()", completionHandler: nil)
     }
-    func applicationDidBecomeActive(_ notification: Notification) { startFirstScanIfVisible() }
+    func applicationDidBecomeActive(_ notification: Notification) { updates?.visibilityChanged(); startFirstScanIfVisible() }
     func applicationDidHide(_ notification: Notification) { stopWhenHidden() }
     func windowDidMiniaturize(_ notification: Notification) { stopWhenHidden() }
     func windowDidChangeOcclusionState(_ notification: Notification) {
@@ -267,6 +372,7 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !quitting else { return .terminateNow }
         quitting = true
+        updates?.shutdown()
         stopWhenHidden()
         guard let child = service, child.isRunning else { return .terminateNow }
         child.terminate()
@@ -400,7 +506,12 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 }
 
-let application = NSApplication.shared
-let delegate = MonitorApp()
-application.delegate = delegate
-application.run()
+@main
+struct MachineMonitorApplication {
+    @MainActor static func main() {
+        let application = NSApplication.shared
+        let delegate = MonitorApp()
+        application.delegate = delegate
+        withExtendedLifetime(delegate) { application.run() }
+    }
+}
