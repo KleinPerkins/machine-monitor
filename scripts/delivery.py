@@ -449,7 +449,8 @@ class Cloudflare:
         try:
             self.query('INSERT INTO entitlements(grant_id,app_id,channel) VALUES(?,?,?)', (grant, APP, 'qualification'))
             path = f'/v1/apps/{APP}/releases/{release_id}/{kind}'
-            request = urllib.request.Request(self.config['origin'] + path, headers={'Authorization': 'Bearer ' + token})
+            request = urllib.request.Request(self.config['origin'] + path, headers={
+                'Authorization': 'Bearer ' + token, 'User-Agent': 'MachineMonitor-Delivery/1.0'})
             digest, size = hashlib.sha256(), 0
             try:
                 with self._opener.open(request, timeout=30) as response:
