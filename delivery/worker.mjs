@@ -24,7 +24,10 @@ async function asset(env, approved, part, method, signal) {
   try {
     if(signal?.aborted)throw new Error('cancelled');
     const response=await timed(env.ASSETS.fetch(new Request(approved+part.path,{method,signal:abort.signal})),cancel);
-    if(response.status!==200 || response.headers.get('Content-Length')!==String(part.size) || response.headers.get('Content-Encoding')) {
+    // Static Assets may omit Content-Length. Reject an inconsistent declaration;
+    // multipart() always enforces the immutable size on the actual streamed body.
+    const length=response.headers.get('Content-Length');
+    if(response.status!==200 || (length!==null && length!==String(part.size)) || response.headers.get('Content-Encoding')) {
       await response.body?.cancel();throw new Error('asset');
     }
     return response;
@@ -127,7 +130,14 @@ export default {async fetch(request, env) {
     let body=null;
     if(request.method==='HEAD') {
       for(const part of ordered)await asset(env,approved,part,'HEAD',request.signal);
-    } else body=await multipart(env,approved,ordered,request.signal);
+    } else {
+      const source=await multipart(env,approved,ordered,request.signal);
+      // Workers ignores a manually declared length for an ordinary stream. This
+      // preserves bounded streaming and emits the length required by our clients.
+      const fixed=new FixedLengthStream(artifact.size);
+      source.pipeTo(fixed.writable).catch(()=>{}); // pipe failures abort readable
+      body=fixed.readable;
+    }
     return new Response(body,{headers:{...POLICY,
       'Content-Type':'application/zip','Content-Length':String(artifact.size),
       'Content-Disposition':'attachment; filename="Machine-Monitor.zip"','Accept-Ranges':'none'}});
