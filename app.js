@@ -49,8 +49,10 @@ function processRow(p,kind,child=false,depth=0){const group=!!p.members,open=exp
 function table(id,f,kind){let key=sorts[kind],rows=[...(f.process_groups||f.processes)].sort((a,b)=>(b[key]??-Infinity)-(a[key]??-Infinity)).slice(0,8);
  let body=rows.map(p=>{let html=processRow(p,kind);if(p.members&&expanded[kind].has(p.id))html+=p.members.map(m=>{let member=observation(f,m.id);return member?processRow(member,kind,true,m.depth):'';}).join('');return html;}).join('');
  const scrollTop=$(id).scrollTop,scrollLeft=$(id).scrollLeft;
+ const focused=document.activeElement,focusKey=$(id).contains(focused)?['sort','expand','process'].find(key=>focused.dataset?.[key]!=null):null,focusValue=focusKey?focused.dataset[focusKey]:null;
  $(id).innerHTML=`<table><colgroup><col style="width:35%"><col style="width:12%"><col style="width:20%"><col style="width:21%"><col style="width:12%"></colgroup><thead><tr><th>Parent / observed tree</th><th><button data-sort="cpu">CPU %</button></th><th><button data-sort="rss">Σ RSS / RAM %</button></th><th><button data-sort="growth">Δ Σ RSS</button></th><th>Trend</th></tr></thead><tbody>${body}</tbody></table>`;
  $(id).scrollTop=scrollTop;$(id).scrollLeft=scrollLeft;
+ if(focusKey)Array.from($(id).querySelectorAll(`[data-${focusKey}]`)).find(button=>button.dataset[focusKey]===focusValue)?.focus({preventScroll:true});
  $(id).querySelectorAll('[data-sort]').forEach(b=>b.onclick=()=>{sorts[kind]=b.dataset.sort;render();});
  $(id).querySelectorAll('[data-expand]').forEach(b=>b.onclick=()=>{const id=b.dataset.expand;expanded[kind].has(id)?expanded[kind].delete(id):expanded[kind].add(id);render();});
  $(id).querySelectorAll('[data-process]').forEach(b=>b.onclick=()=>{selected=b.dataset.process;render();$('selectedProcess').scrollIntoView({block:'nearest',behavior:'instant'});});
