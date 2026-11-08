@@ -19,6 +19,7 @@ PROTECTED = (
     'AGENTS.md', 'README.md', 'SECURITY.md', 'CODEOWNERS', 'LICENSE*', 'THIRD-PARTY-NOTICES.md',
     'Makefile', 'scripts/*', 'tests/*', 'test_*.py', 'requirements*.txt',
     'build_mac_app.py', 'mac/*', 'start.sh',
+    'delivery/*', 'update_*.py', 'PRIVATE-BINARY-LICENSE',
 )
 
 

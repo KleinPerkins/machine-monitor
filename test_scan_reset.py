@@ -2,6 +2,7 @@
 import os
 import copy
 import json
+import uuid
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
@@ -40,6 +41,19 @@ def main():
         assert page.locator('#start').is_disabled()
         page.get_by_role('button',name='Stop scan',exact=True).click();ready(page)
         results['live']={'reset_after_seconds':elapsed,'observations':finished['count'],'second_scan':'started without reload','stop':'all controls reset'}
+        # The native installation handshake must also disable every scan entry.
+        admitted=page.evaluate("async transaction => {const s=await api('install-admit',{transaction});accept(s,true);return s.install_lease;}",str(uuid.uuid4()))
+        before=state(page)
+        assert before['installing'] and not before['active']
+        assert page.locator('#start').is_disabled() and page.locator('#snapshot').is_disabled()
+        assert page.locator('#duration').is_disabled()
+        assert page.locator('#state').inner_text()=='Installing update'
+        page.evaluate('void start(30)');page.wait_for_timeout(150)
+        after=state(page)
+        assert after['collections']==before['collections'] and not after['active']
+        page.evaluate("async token => {const s=await api('install-release',{install_lease:token});accept(s,true);}",admitted)
+        ready(page)
+        results['install_admission']='scan controls and programmatic start blocked until verified abort release'
         seed=state(page);seed['active']=False
         # Completion must unlock controls even when the final state request fails.
         isolated=context.new_page();starts=[];reads=[0]

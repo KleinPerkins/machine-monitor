@@ -14,7 +14,8 @@
       "id": "governance",
       "tests": [
         "tests/test_governance.py",
-        "tests/test_automation.py"
+        "tests/test_automation.py",
+        "tests/test_toolchain.py"
       ],
       "command": [
         "python3",
@@ -39,7 +40,8 @@
     {
       "id": "service",
       "tests": [
-        "tests/test_service.py"
+        "tests/test_service.py",
+        "tests/test_update_channel.py"
       ],
       "command": [
         "python3",
@@ -54,7 +56,8 @@
         "test_hover_layout.py",
         "test_rollup_browser.py",
         "test_temperature_browser.py",
-        "test_scenarios.py"
+        "test_scenarios.py",
+        "tests/test_update_download_layout.py"
       ],
       "command": [
         "python3",
@@ -68,7 +71,8 @@
       "tests": [
         "test_browser.py",
         "test_scan_reset.py",
-        "test_desktop_visibility.py"
+        "test_desktop_visibility.py",
+        "tests/test_update_download_lifecycle.py"
       ],
       "command": [
         "python3",
@@ -81,7 +85,11 @@
       "id": "native-app",
       "tests": [
         "test_desktop_service.py",
-        "tests/test_native_app.py"
+        "tests/test_native_app.py",
+        "tests/test_release.py",
+        "tests/test_update_preflight.py",
+        "tests/test_update_recovery.py",
+        "tests/test_native_updates.py"
       ],
       "command": [
         "python3",

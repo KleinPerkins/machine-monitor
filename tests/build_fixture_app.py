@@ -18,8 +18,13 @@ from scripts.processes import run_build
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ('monitor.py', 'temperatures.py', 'index.html', 'app.js', 'style.css',
-           'build_mac_app.py', 'THIRD-PARTY-NOTICES.md', 'LICENSE', 'mac/MachineMonitor.swift',
-           'mac/MakeIcon.swift', 'scripts/__init__.py', 'scripts/processes.py', 'tests/__init__.py', 'tests/fixtures.py', 'tests/fixture_service.py')
+           'build_mac_app.py', 'THIRD-PARTY-NOTICES.md', 'LICENSE', 'PRIVATE-BINARY-LICENSE',
+           'update_contract.py', 'update_preflight.py', 'update_recovery.py',
+           'mac/MachineMonitor.swift', 'mac/MakeIcon.swift', 'mac/RecoveryMain.swift', 'mac/RecoveryModel.swift',
+           'mac/UpdateCore.swift', 'mac/UpdateTransport.swift', 'mac/UpdateBridge.swift', 'mac/UpdateState.swift',
+           'mac/UpdateHelper.swift', 'mac/UpdateSparkle.swift', 'mac/UpdateCoordinator.swift', 'mac/UpdateSettings.swift', 'mac/UpdateJSON.swift',
+           'scripts/__init__.py', 'scripts/processes.py', 'scripts/sparkle.py',
+           'tests/__init__.py', 'tests/fixtures.py', 'tests/fixture_service.py')
 
 
 def build(destination):

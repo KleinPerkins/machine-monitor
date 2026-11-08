@@ -37,3 +37,21 @@ The app bundles CPython 3.14.6, psutil 7.2.2 and the PyInstaller 6.22.3 bootload
 
 Packaging reference: https://pyinstaller.org/en/stable/operating-mode.html
 Native web view reference: https://developer.apple.com/documentation/webkit/wkwebview
+
+## Sparkle updater
+
+The native application embeds Sparkle 2.10.1 from the official distribution,
+verified against SHA-256
+`1a856d2a9edb8e628de88121d7be04cf0e2167f8641650b78fca00b14244cf27`.
+The distribution's complete license and included third-party notices are copied
+unchanged to `Contents/Resources/Licenses/Sparkle-LICENSE`. Its licensing applies
+independently of this repository's proprietary source and private binary terms.
+
+Source: https://github.com/sparkle-project/Sparkle/tree/ab7d71291238df6e0492143b120c9b696a35f603
+
+Official integration reference: https://sparkle-project.org/documentation/
+
+Node 26.4.0 and Wrangler 4.158.0 are owner/development verification or deployment
+tools. They are not included in the delivered Mac applications. The applications
+use system AppKit, WebKit, Security, Network and CryptoKit frameworks supplied by
+macOS.

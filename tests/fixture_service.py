@@ -24,6 +24,6 @@ def main():
         return engine
     monitor.Engine=fixture_engine
     if '--seed-history' in sys.argv:sys.argv.remove('--seed-history')
-    monitor.main()
+    return monitor.main()
 
-if __name__=='__main__':main()
+if __name__=='__main__':raise SystemExit(main())

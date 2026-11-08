@@ -28,15 +28,37 @@ def run_suite(files):
 
 
 def execute(identity, files, output):
+    if identity in ('service', 'browser-layout', 'browser-lifecycle', 'native-app'):
+        from scripts.toolchain import node
+        os.environ['MONITOR_NODE'] = str(node())
     if identity == 'governance':
         from scripts.workflow_lint import lint
         lint(ROOT)
     if identity.startswith('browser-'):
         from tests.browser_support import run
+        count = 0
         for name in files:
-            run(name, output / Path(name).stem)
-        return len(files)
+            destination = output / Path(name).stem
+            destination.mkdir(parents=True, exist_ok=True)
+            if name.startswith('tests/'):
+                # Delivery UI wrappers own a separate synthetic HTTPS service.
+                # Do not create an unrelated metrics collector for these tests.
+                previous = os.environ.get('MONITOR_TEST_OUTPUT')
+                os.environ['MONITOR_TEST_OUTPUT'] = str(destination)
+                try:
+                    count += run_suite([name])
+                finally:
+                    if previous is None:
+                        os.environ.pop('MONITOR_TEST_OUTPUT', None)
+                    else:
+                        os.environ['MONITOR_TEST_OUTPUT'] = previous
+            else:
+                run(name, destination)
+                count += 1
+        return count
     if identity == 'native-app':
+        from scripts.sparkle import distribution
+        os.environ['MONITOR_SPARKLE_FRAMEWORK_DIR'] = str(distribution())
         from tests.build_fixture_app import build
         app = build(output / 'Machine Monitor Fixture Tests.app')
         os.environ['MONITOR_TEST_SERVICE'] = str(app / 'Contents/Resources/service/monitor-service')
