@@ -279,10 +279,15 @@ class ChannelTests(unittest.TestCase):
             return urllib.error.HTTPError('https://api.cloudflare.com/client/v4',status,'synthetic',{},io.BytesIO(body or json.dumps(value).encode()))
         for path in ('/workers/subdomain','/workers/scripts/monitor/deployments'):
             with patch.object(api._opener,'open',side_effect=refused()):self.assertIsNone(api.api(path,allow_not_found=True))
+            response=MagicMock();response.__enter__.return_value.read.return_value=b'{"success":true,"result":null}'
+            with patch.object(api._opener,'open',return_value=response),self.assertRaises(delivery.DeliveryError):api.api(path,allow_not_found=True)
             for error in (refused(403),refused(codes=(10000,)),refused(codes=(10007,10000)),refused(success=True),refused(body=b'not-json')):
                 with patch.object(api._opener,'open',side_effect=error),self.assertRaises(delivery.DeliveryError):api.api(path,allow_not_found=True)
             with patch.object(api._opener,'open',side_effect=refused()),self.assertRaises(delivery.DeliveryError):api.api(path)
         with patch.object(api._opener,'open',side_effect=refused()),self.assertRaises(delivery.DeliveryError):api.api('/d1/database',allow_not_found=True)
+        response=MagicMock();response.__enter__.return_value.read.return_value=b'{"success":true,"result":null}'
+        with patch.object(api._opener,'open',return_value=response) as calls,self.assertRaises(delivery.DeliveryError):api.create_subdomain('new-fixture')
+        self.assertEqual(calls.call_count,1)
 
     def test_deployment_requires_unconditional_private_worker_first_and_owned_origin(self):
         config = self.api.config

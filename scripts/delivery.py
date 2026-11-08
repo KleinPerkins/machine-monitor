@@ -295,6 +295,8 @@ class Cloudflare:
             parsed = json.loads(data)
             if parsed.get('success') is not True:
                 raise DeliveryError('Cloudflare refused the operation.')
+            if effective_method=='GET' and parsed.get('result') is None:
+                raise DeliveryError('Cloudflare resource inventory is unknown; no operation performed.')
             return parsed['result']
         except urllib.error.HTTPError as error:
             absent=False
