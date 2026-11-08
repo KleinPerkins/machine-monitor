@@ -61,7 +61,9 @@ class PreflightTests(unittest.TestCase):
                  ('Monitor.app/Contents/Frameworks/F.framework/Versions/A/F',b'fixture',stat.S_IFREG|0o755),
                  ('Monitor.app/Contents/Frameworks/F.framework/Versions/Current',b'A',stat.S_IFLNK|0o777),
                  ('Monitor.app/Contents/Frameworks/F.framework/F',b'Versions/Current/F',stat.S_IFLNK|0o777)]
-        self.assertTrue(self.extract(entries)['ok'])
+        result=self.extract(entries)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['expanded_size'],preflight.tree_digest(result['app_path'])[1])
 
     def test_limits_entry_size_ratio_time_space(self):
         for limits in ({'entries':1},{'expanded':1},{'ratio':0},{'seconds':-1}):
