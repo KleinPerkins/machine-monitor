@@ -160,6 +160,7 @@ private final class FixtureProtocol: URLProtocol {
         let received: Result<Data, Error> = try awaitValue { done in transport.request(url: origin.appendingPathComponent("v1/access/check"), token: token, limit: 100, completion: done) }
         try check(try received.get() == FixtureProtocol.bytes, "owned fixture session response")
         try check(FixtureProtocol.seen?.value(forHTTPHeaderField: "Authorization") == "Bearer " + token, "scoped authorization")
+        try check(FixtureProtocol.seen?.value(forHTTPHeaderField: "User-Agent") == "MachineMonitor-Update/1.0", "descriptive application client")
         try check(FixtureProtocol.seen?.value(forHTTPHeaderField: "Cookie") == nil, "no cookies")
         let denied: Result<Data, Error> = try awaitValue { done in transport.request(url: URL(string: "https://other.invalid/v1/access/check")!, token: token, limit: 100, completion: done) }
         try refuses("cross-origin request") { _ = try denied.get() }

@@ -46,6 +46,7 @@ final class UpdateTransport: NSObject, URLSessionDataDelegate, @unchecked Sendab
         var request = URLRequest(url: url)
         request.httpMethod = body == nil ? "GET" : "POST"; request.httpBody = body
         request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+        request.setValue("MachineMonitor-Update/1.0", forHTTPHeaderField: "User-Agent")
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }

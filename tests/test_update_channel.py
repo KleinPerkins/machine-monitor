@@ -289,6 +289,19 @@ class ChannelTests(unittest.TestCase):
         with patch.object(api._opener,'open',return_value=response) as calls,self.assertRaises(delivery.DeliveryError):api.create_subdomain('new-fixture')
         self.assertEqual(calls.call_count,1)
 
+    def test_private_readback_identifies_application_and_revokes_temporary_grant(self):
+        api=delivery.Cloudflare.__new__(delivery.Cloudflare);api.config=self.api.config;api._opener=MagicMock()
+        response=MagicMock();response.status=200;response.headers={'Content-Length':'4'};response.read.side_effect=[b'test',b'']
+        api._opener.open.return_value.__enter__.return_value=response
+        with patch.object(api,'query',return_value=[]) as queries:
+            api.readback('fixture',{'size':4,'sha256':hashlib.sha256(b'test').hexdigest()},'archive')
+        request=api._opener.open.call_args.args[0]
+        self.assertEqual(request.get_header('User-agent'),'MachineMonitor-Delivery/1.0')
+        self.assertEqual(request.full_url,self.api.config['origin']+'/v1/apps/'+delivery.APP+'/releases/fixture/archive')
+        self.assertTrue(request.get_header('Authorization').startswith('Bearer '))
+        self.assertNotIn(request.get_header('Authorization')[7:],repr(queries.call_args_list))
+        self.assertIn('revoked_at',queries.call_args.args[0])
+
     def test_deployment_requires_unconditional_private_worker_first_and_owned_origin(self):
         config = self.api.config
         api = delivery.Cloudflare.__new__(delivery.Cloudflare);api.config = config

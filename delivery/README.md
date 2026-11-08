@@ -102,6 +102,11 @@ required because quieter levels suppress its JSON output. All stdout/stderr stay
 captured; disk logging, metrics, error reporting, observability and inherited
 output-file overrides are disabled. API redirects and nonofficial origins deny.
 
+Owner archive readback and native HTTP requests send descriptive application
+`User-Agent` headers. This follows Cloudflare's
+[workers.dev client guidance](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1010/)
+for requests rejected when a library-default identifier is used.
+
 - `--config /private/config.json deploy` checks Free evidence, exact account-owned
   `{worker}.{subdomain}.workers.dev` origin and the complete private asset tree,
   applies the additive D1 schema and deploys one version at 100 percent. Generated
