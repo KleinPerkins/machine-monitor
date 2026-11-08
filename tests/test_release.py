@@ -210,13 +210,16 @@ class ArtifactTests(unittest.TestCase):
         verify.assert_called_once()
 
     def test_signature_metadata_requires_team_timestamp_and_runtime(self):
-        good = f'TeamIdentifier={r.TEAM}\nAuthority=Developer ID Application: Fixture\nflags=0x10000(runtime)\nTimestamp=Jan 1\n'
+        good = f'TeamIdentifier={r.TEAM}\nAuthority=Developer ID Application: Fixture\nCodeDirectory v=20500 size=100 flags=0x10000(runtime) hashes=1+5 location=embedded\nTimestamp=Jan 1\n'
         r.display_code(self.app, lambda *a, **k: good.encode())
         for absent in (r.TEAM, 'runtime', 'Timestamp=Jan 1', 'Authority=Developer ID Application:'):
             with self.assertRaises(r.ReleaseError):
                 r.display_code(self.app, lambda *a, **k: good.replace(absent, '').encode())
         for flags in ('flags=0x0(none)','flags=0x0(runtime)','flags=0x10000(none)','flags=runtime'):
             bad='Executable=/private/tmp/runtime/Machine Monitor\n'+good.replace('flags=0x10000(runtime)',flags)
+            with self.assertRaises(r.ReleaseError):r.display_code(self.app,lambda *a,**k:bad.encode())
+        for bad in ('Executable=/private/tmp/release flags=0x10000(runtime)/Machine Monitor\n'+good.replace('flags=0x10000(runtime)','flags=0x0(none)'),
+                    good+good,good.replace('CodeDirectory','AbsentDirectory')):
             with self.assertRaises(r.ReleaseError):r.display_code(self.app,lambda *a,**k:bad.encode())
 
     def test_notary_rejection_never_staples(self):
@@ -354,7 +357,7 @@ class ArtifactTests(unittest.TestCase):
                 return b'cmd LC_BUILD_VERSION\ncmdsize 32\nplatform 1\nminos 26.0\nsdk 26.0'
             if 'lipo' in args[0]: return b'arm64'
             if '-c' in args:
-                return f'TeamIdentifier={r.TEAM}\nAuthority=Developer ID Application: Fixture\nflags=0x10000(runtime)\nTimestamp=fixture\n'.encode()
+                return f'TeamIdentifier={r.TEAM}\nAuthority=Developer ID Application: Fixture\nCodeDirectory v=20500 size=100 flags=0x10000(runtime) hashes=1+5 location=embedded\nTimestamp=fixture\n'.encode()
             if 'notarytool' in args:
                 with zipfile.ZipFile(args[3]) as archive:
                     uploaded.append(archive.namelist())

@@ -297,9 +297,19 @@ class Cloudflare:
                 raise DeliveryError('Cloudflare refused the operation.')
             return parsed['result']
         except urllib.error.HTTPError as error:
-            if (allow_not_found and error.code == 404 and effective_method == 'GET' and
-                re.fullmatch(r'/workers/scripts/[a-z0-9][a-z0-9_-]{0,62}/deployments', suffix)):
-                return None
+            absent=False
+            try:
+                if (allow_not_found and error.code == 404 and effective_method == 'GET' and
+                    (suffix=='/workers/subdomain' or re.fullmatch(r'/workers/scripts/[a-z0-9][a-z0-9_-]{0,62}/deployments', suffix))):
+                    data=error.read(65537)
+                    if len(data)<=65536:
+                        missing=json.loads(data)
+                        absent=(isinstance(missing,dict) and missing.get('success') is False and
+                            isinstance(missing.get('errors'),list) and len(missing['errors'])==1 and
+                            missing['errors'][0].get('code')==10007)
+            except (ValueError,UnicodeError,AttributeError,TypeError):pass
+            finally:error.close()
+            if absent:return None
             raise DeliveryError('Cloudflare API operation failed; no public fallback was used.') from None
         except (urllib.error.URLError, ValueError, KeyError):
             raise DeliveryError('Cloudflare API operation failed; no public fallback was used.') from None
@@ -358,10 +368,13 @@ class Cloudflare:
     def create_subdomain(self, name):
         self.require_free()
         if not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', name): raise DeliveryError('Invalid subdomain.')
-        current = self.api('/workers/subdomain')
-        if current.get('subdomain'):
+        current = self.api('/workers/subdomain',allow_not_found=True)
+        if current is not None:
             raise DeliveryError('Existing subdomain must be retained; no replacement is supported.')
-        return self.api('/workers/subdomain', {'subdomain': name}, 'PUT')
+        created=self.api('/workers/subdomain', {'subdomain': name}, 'PUT')
+        if not isinstance(created,dict) or created.get('subdomain')!=name:
+            raise DeliveryError('Created subdomain readback differs; inspect privately before continuing.')
+        return created
 
     def privacy(self):
         return audit_deployment(self)

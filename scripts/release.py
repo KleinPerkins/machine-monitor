@@ -326,7 +326,8 @@ def display_code(target, run):
     bridge = ('import subprocess,sys; p=subprocess.run(sys.argv[1:],capture_output=True); '
               'sys.stdout.buffer.write(p.stderr); sys.exit(p.returncode)')
     output = run([sys.executable, '-c', bridge, '/usr/bin/codesign', '-d', '--verbose=4', str(target)]).decode()
-    flags=re.search(r'(?:^|\s)flags=0x([0-9a-fA-F]+)\(([^)\n]*)\)',output)
+    directories=re.findall(r'^CodeDirectory[^\r\n]*$',output,re.M)
+    flags=re.search(r'\bflags=0x([0-9a-fA-F]+)\(([^)\n]*)\)',directories[0]) if len(directories)==1 else None
     require('TeamIdentifier=' + TEAM in output and 'Authority=Developer ID Application:' in output
             and flags and int(flags[1],16)&0x10000 and 'runtime' in flags[2].split(',') and re.search(r'^Timestamp=.+', output, re.M),
             'Nested code lacks Developer ID, hardened runtime, or secure timestamp.')

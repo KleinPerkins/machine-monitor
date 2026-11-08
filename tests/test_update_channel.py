@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import urllib.error
 from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -261,11 +262,27 @@ class ChannelTests(unittest.TestCase):
         for databases in ([{'name':'new-fixture'}], [{'name':'x'}] * 10, None):
             with patch.object(api,'api',return_value=databases) as calls, self.assertRaises(delivery.DeliveryError):api.create_database('new-fixture')
             self.assertEqual(calls.call_count,1)
-        with patch.object(api,'api',side_effect=[{'subdomain':''},{'subdomain':'new-fixture'}]) as calls:
+        with patch.object(api,'api',side_effect=[None,{'subdomain':'new-fixture'}]) as calls:
             self.assertEqual(api.create_subdomain('new-fixture')['subdomain'],'new-fixture')
             self.assertEqual(calls.call_args.args,('/workers/subdomain',{'subdomain':'new-fixture'},'PUT'))
         with patch.object(api,'api',return_value={'subdomain':'existing'}) as calls, self.assertRaises(delivery.DeliveryError):api.create_subdomain('new-fixture')
         self.assertEqual(calls.call_count,1)
+        for unknown in ({},{'subdomain':''},[],False):
+            with patch.object(api,'api',return_value=unknown) as calls,self.assertRaises(delivery.DeliveryError):api.create_subdomain('new-fixture')
+            self.assertEqual(calls.call_count,1)
+
+    def test_initial_missing_resource_requires_exact_provider_error(self):
+        api=delivery.Cloudflare.__new__(delivery.Cloudflare);api.config=self.api.config
+        api._authorization='Bearer synthetic-only';api._opener=MagicMock()
+        def refused(status=404,codes=(10007,),success=False,body=None):
+            value={'success':success,'errors':[{'code':code} for code in codes],'result':None}
+            return urllib.error.HTTPError('https://api.cloudflare.com/client/v4',status,'synthetic',{},io.BytesIO(body or json.dumps(value).encode()))
+        for path in ('/workers/subdomain','/workers/scripts/monitor/deployments'):
+            with patch.object(api._opener,'open',side_effect=refused()):self.assertIsNone(api.api(path,allow_not_found=True))
+            for error in (refused(403),refused(codes=(10000,)),refused(codes=(10007,10000)),refused(success=True),refused(body=b'not-json')):
+                with patch.object(api._opener,'open',side_effect=error),self.assertRaises(delivery.DeliveryError):api.api(path,allow_not_found=True)
+            with patch.object(api._opener,'open',side_effect=refused()),self.assertRaises(delivery.DeliveryError):api.api(path)
+        with patch.object(api._opener,'open',side_effect=refused()),self.assertRaises(delivery.DeliveryError):api.api('/d1/database',allow_not_found=True)
 
     def test_deployment_requires_unconditional_private_worker_first_and_owned_origin(self):
         config = self.api.config
