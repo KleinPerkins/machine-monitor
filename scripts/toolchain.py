@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
+import urllib.error
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +20,30 @@ NODE_ARCHIVE = f'node-v{NODE_VERSION}-darwin-arm64.tar.xz'
 NODE_SHA256 = 'bef4c7e75087c029835f519a7ba640eba52fa617fadb3a9049828ff3b45b57dd'
 MAX_ARCHIVE = 100 * 1024**2
 MAX_EXPANDED = 512 * 1024**2
+
+
+def download_bytes(url, maximum, timeout):
+    """Retry transient transport failures three times, retaining no partial body.
+
+    Callers still verify the size and pinned digest before extracting any bytes.
+    Permanent HTTP errors, TLS validation and content failures do not retry.
+    """
+    for attempt, delay in enumerate((0, 1, 3)):
+        if delay:
+            time.sleep(delay)
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                return response.read(maximum + 1)
+        except urllib.error.HTTPError as error:
+            error.close()
+            if error.code not in (500, 502, 503, 504) or attempt == 2:
+                raise
+        except urllib.error.URLError as error:
+            if not isinstance(error.reason, (TimeoutError, ConnectionResetError, ConnectionAbortedError)) or attempt == 2:
+                raise
+        except (TimeoutError, ConnectionResetError, ConnectionAbortedError):
+            if attempt == 2:
+                raise
 
 
 def _version(binary):
@@ -56,8 +82,7 @@ def node(cache=None):
             }:
                 raise ValueError('Cached verification runtime changed')
             return _version(binary)
-        with urllib.request.urlopen(f'https://nodejs.org/dist/v{NODE_VERSION}/{NODE_ARCHIVE}', timeout=30) as response:
-            payload = response.read(MAX_ARCHIVE + 1)
+        payload = download_bytes(f'https://nodejs.org/dist/v{NODE_VERSION}/{NODE_ARCHIVE}', MAX_ARCHIVE, 30)
         if len(payload) > MAX_ARCHIVE or hashlib.sha256(payload).hexdigest() != NODE_SHA256:
             raise ValueError('Verification runtime archive checksum mismatch')
         with tempfile.TemporaryDirectory(prefix='node-stage-', dir=cache) as temporary:

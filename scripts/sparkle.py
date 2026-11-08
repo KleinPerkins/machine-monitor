@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import tarfile
 import tempfile
-import urllib.request
+from scripts.toolchain import download_bytes
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = '2.10.1'
@@ -47,8 +47,7 @@ def distribution(cache=None):
             if target.is_symlink() or receipt != {'archive_sha256': SHA256, 'files': _manifest(target)}:
                 raise ValueError('Cached Sparkle distribution changed')
             return target
-        with urllib.request.urlopen(URL, timeout=40) as response:
-            payload = response.read(40 * 1024**2 + 1)
+        payload = download_bytes(URL, 40 * 1024**2, 40)
         if len(payload) > 40 * 1024**2 or hashlib.sha256(payload).hexdigest() != SHA256:
             raise ValueError('Sparkle archive checksum mismatch')
         with tempfile.TemporaryDirectory(prefix='sparkle-stage-', dir=cache) as temporary:

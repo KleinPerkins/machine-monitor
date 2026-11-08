@@ -6,7 +6,7 @@ import platform
 import subprocess
 import tarfile
 import tempfile
-import urllib.request
+from scripts.toolchain import download_bytes
 
 VERSION = '1.7.12'
 ASSETS = {
@@ -17,8 +17,7 @@ ASSETS = {
 def lint(root):
     target, digest = ASSETS[(platform.system(), platform.machine())]
     url = f'https://github.com/rhysd/actionlint/releases/download/v{VERSION}/actionlint_{VERSION}_{target}.tar.gz'
-    with urllib.request.urlopen(url, timeout=30) as response:
-        data = response.read(20 * 1024 * 1024 + 1)
+    data = download_bytes(url, 20 * 1024 * 1024, 30)
     if len(data) > 20 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != digest:
         raise RuntimeError('Workflow validator checksum mismatch')
     with tempfile.TemporaryDirectory(prefix='monitor-actionlint-') as temporary:
