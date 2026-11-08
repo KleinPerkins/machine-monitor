@@ -304,10 +304,27 @@ def publish(api, value, receipt, archive=None, package=None):
         raise DeliveryError('Immutable release retained, but channel did not advance: build must increase.')
 
 
-def deployment_config(config):
+def deployment_config(config, api=None):
     result = json.loads((ROOT / 'delivery/wrangler.template.json').read_text())
     result.update(name=config['worker_name'], main=str(ROOT / 'delivery/worker.mjs'), account_id=config['account_id'])
-    result['routes'] = [{'pattern': urllib.parse.urlsplit(config['origin']).hostname, 'custom_domain': True}]
+    hostname = urllib.parse.urlsplit(config['origin']).hostname
+    if hostname == 'workers.dev' or hostname.endswith('.workers.dev'):
+        # Read-only ownership proof: never create or claim an account subdomain.
+        if api is None:
+            raise DeliveryError('Account-owned workers.dev origin requires current subdomain verification.')
+        ownership = api.api('/workers/subdomain')
+        subdomain = ownership.get('subdomain') if isinstance(ownership, dict) else None
+        label = r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
+        if (not isinstance(subdomain, str) or not re.fullmatch(label, subdomain) or
+            not re.fullmatch(label, config['worker_name']) or
+            hostname != config['worker_name'] + '.' + subdomain + '.workers.dev'):
+            raise DeliveryError('Configured origin does not match this worker and the account-owned workers.dev subdomain.')
+        result['workers_dev'] = True
+        result['routes'] = []
+    else:
+        result['workers_dev'] = False
+        result['routes'] = [{'pattern': hostname, 'custom_domain': True}]
+    result['preview_urls'] = False
     result['vars'] = {'UPDATE_ORIGIN': config['origin']}
     result['d1_databases'] = [{'binding': 'DB', 'database_name': config['database_name'], 'database_id': config['database_id']}]
     result['r2_buckets'] = [{'binding': 'ARCHIVES', 'bucket_name': config['bucket_name']}]
@@ -350,11 +367,13 @@ def main():
             print('R2 public access disabled; no bucket custom domains.')
         elif args.command == 'deploy':
             api.privacy()
+            # Ownership/configuration must pass before any deployment/schema write.
+            configured = deployment_config(config, api)
             # Explicit existing resources only. No create/upgrade/pay command exists.
             api.query((ROOT / 'delivery/schema.sql').read_text())
             with tempfile.TemporaryDirectory(prefix='monitor-deploy-') as folder:
                 filename = Path(folder).resolve() / 'wrangler.json'
-                private_write(filename, deployment_config(config))
+                private_write(filename, configured)
                 api.wrangler('deploy', '--config', str(filename), timeout=180)
             api.privacy()
             print('Worker deployment completed. Binary publication and live qualification remain separate.')

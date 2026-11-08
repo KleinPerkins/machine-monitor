@@ -73,7 +73,13 @@ executed by the public UI, Worker or recipient applications.
   managed `enabled=false` and no custom domains are required. Unknown state fails.
 - `--config /private/config.json deploy` repeats that gate, applies the additive
   fixed D1 schema, and deploys the Worker with existing explicit bindings,
-  workers.dev/preview URLs disabled and the selected custom hostname. No account,
+  preview URLs disabled. An approved custom hostname uses a custom-domain route
+  with workers.dev disabled. Alternatively an explicit workers.dev origin must
+  match exactly `{worker_name}.{account_owned_subdomain}.workers.dev`, proven
+  through the read-only account `/workers/subdomain` API before any schema/deploy
+  write; that choice enables workers.dev and uses no custom-domain routes. No
+  subdomain is claimed/created, no aliases or preview origins are accepted by the
+  Worker, and no separate custom-domain prerequisite applies. No account,
   database, bucket, paid plan or account upgrade is created/enabled. This operation
   still requires the owner-authorized deployment gate.
 - `--config /private/config.json create-grant --label OPAQUE_LABEL --expires-at UNIX_SECONDS --output /private/recipient.machine-monitor-access`
@@ -137,3 +143,5 @@ Primary implementation references:
 [Wrangler config](https://developers.cloudflare.com/workers/wrangler/configuration/).
 
 Pinned-source checks for this owner-auth path: [4.158.0 auth command](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.158.0/packages/wrangler/src/user/commands.ts), [JSON logger and disk-log opt-out](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.158.0/packages/wrangler/src/logger.ts).
+
+Account-owned primary origin reference: [Get a Workers Subdomain](https://developers.cloudflare.com/api/resources/workers/subresources/subdomains/methods/get/).

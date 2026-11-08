@@ -66,6 +66,15 @@ async function run(){
    const malformed=f.makeRelease('stable','bad-4');malformed.archive.path='https://attacker.invalid/object';f.put(malformed);const fresh=f.addGrant('fresh');await expect(feed,fresh,503);
    assert.throws(()=>f.db.prepare('UPDATE releases SET archive_size=1').run());
    const base=f.makeRelease('stable','missing-5');f.put(base);f.objects.clear();await expect(`/v1/apps/${APP}/releases/missing-5/archive`,fresh,503);
+   const owned=fixture('https://monitor.owned-fixture.workers.dev');
+   try {
+     assert.equal((await owned.request(feed,owned.friend)).status,200);
+     for(const host of ['alias.monitor.owned-fixture.workers.dev','other.owned-fixture.workers.dev','monitor.foreign.workers.dev']) {
+       const response=await worker.fetch(new Request('https://'+host+feed,{headers:{Authorization:'Bearer '+owned.friend}}),owned.env);
+       assert.equal(response.status,400);assert.match(response.headers.get('Cache-Control'),/no-store/);
+       assertions++;
+     }
+   }finally{owned.close();}
    const noOrigin={...f.env,UPDATE_ORIGIN:'http://insecure.invalid'};assert.equal((await worker.fetch(new Request('http://insecure.invalid/'),noOrigin)).status,503);
    console.log(JSON.stringify({passed:true,assertions,primary_reads:f.primaryReads,r2_reads:f.r2Reads}));
  }finally{f.close();}

@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('owner_delivery', ROOT / 'scripts/delivery.py')
@@ -203,6 +203,66 @@ class ChannelTests(unittest.TestCase):
             api.privacy()
         with self.assertRaises(delivery.DeliveryError):
             delivery.NoRedirect().redirect_request(None, None, None, None, None, None)
+
+    def test_deployment_supports_exact_owned_workers_dev_primary_origin(self):
+        config = dict(origin='https://monitor.owned-fixture.workers.dev', worker_name='monitor',
+                      account_id='a' * 32, database_name='fixture', database_id='b' * 36,
+                      bucket_name='fixture', wrangler='/fixture/wrangler')
+        api = delivery.Cloudflare.__new__(delivery.Cloudflare)
+        api.config = config
+        with patch.object(api, 'api', return_value={'subdomain': 'owned-fixture'}) as current:
+            result = delivery.deployment_config(config, api)
+            current.assert_called_once_with('/workers/subdomain')
+        self.assertTrue(result['workers_dev'])
+        self.assertFalse(result['preview_urls'])
+        self.assertEqual(result['routes'], [])
+        self.assertEqual(result['vars']['UPDATE_ORIGIN'], config['origin'])
+        self.assertEqual(result['d1_databases'][0]['binding'], 'DB')
+        self.assertEqual(result['r2_buckets'][0]['binding'], 'ARCHIVES')
+        with self.assertRaises(delivery.DeliveryError):
+            delivery.deployment_config(config)
+        for ownership in ({}, None, {'subdomain': 'foreign'}, {'subdomain': 'owned-fixture.workers.dev'},
+                          {'subdomain': 'owned-fixture/unsafe'}, {'subdomain': 'Owned-fixture'}):
+            with patch.object(api, 'api', return_value=ownership), self.assertRaises(delivery.DeliveryError):
+                delivery.deployment_config(config, api)
+        for host in ('other.owned-fixture.workers.dev', 'alias.monitor.owned-fixture.workers.dev',
+                     'monitor.foreign.workers.dev', 'workers.dev'):
+            with patch.object(api, 'api', return_value={'subdomain': 'owned-fixture'}), self.assertRaises(delivery.DeliveryError):
+                delivery.deployment_config(dict(config, origin='https://' + host), api)
+        with patch.object(api, 'api', side_effect=delivery.DeliveryError('Provider unavailable.')), self.assertRaises(delivery.DeliveryError):
+            delivery.deployment_config(config, api)
+
+    def test_workers_dev_config_is_explicit_and_ownership_failure_precedes_writes(self):
+        config = dict(origin='https://monitor.owned-fixture.workers.dev', worker_name='monitor',
+                      account_id='a' * 32, database_name='fixture', database_id='b' * 36,
+                      bucket_name='fixture', wrangler='/fixture/wrangler')
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            binary = root / 'fixture-wrangler'
+            binary.write_text('not executed')
+            config['wrangler'] = str(binary)
+            filename = root / 'owner.json'
+            delivery.private_write(filename, config)
+            self.assertEqual(delivery.load_config(filename), config)
+        api = MagicMock()
+        api.api.return_value = {'subdomain': 'foreign-account'}
+        with patch.object(delivery, 'load_config', return_value=config), patch.object(delivery, 'Cloudflare', return_value=api), patch.object(delivery.sys, 'argv', ['delivery.py', '--config', '/unused/owner.json', 'deploy']), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(delivery.main(), 1)
+        api.api.assert_called_once_with('/workers/subdomain')
+        api.query.assert_not_called()
+        api.wrangler.assert_not_called()
+
+    def test_custom_domain_deployment_disables_workers_dev_without_ownership_read(self):
+        config = dict(origin='https://download.example.invalid', worker_name='monitor',
+                      account_id='a' * 32, database_name='fixture', database_id='b' * 36,
+                      bucket_name='fixture', wrangler='/fixture/wrangler')
+        api = delivery.Cloudflare.__new__(delivery.Cloudflare)
+        with patch.object(api, 'api', side_effect=AssertionError('Custom hostname needs no workers.dev read')):
+            result = delivery.deployment_config(config, api)
+        self.assertFalse(result['workers_dev'])
+        self.assertFalse(result['preview_urls'])
+        self.assertEqual(result['routes'], [{'pattern': 'download.example.invalid', 'custom_domain': True}])
+        self.assertEqual(result['vars']['UPDATE_ORIGIN'], config['origin'])
 
     def test_pinned_wrangler_auth_is_captured_without_argv_secrets(self):
         secret = 'fixture-owner-token'
