@@ -92,7 +92,7 @@ def command(args, *, cwd=None, input=None, timeout=60):
                     output[key.data].extend(chunk)
         try:process.wait(timeout=max(.001,deadline-time.monotonic()))
         except subprocess.TimeoutExpired:raise ReleaseError('Release operation timed out; no qualification was issued.') from None
-        require(process.returncode == 0,'Release operation failed; inspect owner prerequisites privately.')
+        require(process.returncode == 0,Path(str(args[0])).name+' exited with status '+str(process.returncode)+'; no qualification was issued.')
         return bytes(output['stdout'])
     except OSError:
         raise ReleaseError('Required release tool is unavailable.') from None
@@ -311,13 +311,13 @@ def verify_code(app, run=command):
     requirement = ('anchor apple generic and certificate leaf[subject.OU] = "' + TEAM +
                    '" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists')
     for target in [*mach_files(app), app]:
-        run(['/usr/bin/codesign', '--verify', '--strict', '-R', requirement, str(target)])
+        run(['/usr/bin/codesign', '--verify', '--strict', '-R', '=' + requirement, str(target)])
         # codesign displays metadata on stderr, so command output selection is
         # handled by display_code below instead of trusting the process exit.
         display_code(target, run)
     bundle_id = APP + ('.recovery' if app.name == 'Machine Monitor Recovery.app' else '')
     run(['/usr/bin/codesign', '--verify', '--deep', '--strict', '-R',
-         requirement + ' and identifier "' + bundle_id + '"', str(app)])
+         '=' + requirement + ' and identifier "' + bundle_id + '"', str(app)])
 
 
 def display_code(target, run):

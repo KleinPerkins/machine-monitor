@@ -222,6 +222,18 @@ class ArtifactTests(unittest.TestCase):
                     good+good,good.replace('CodeDirectory','AbsentDirectory')):
             with self.assertRaises(r.ReleaseError):r.display_code(self.app,lambda *a,**k:bad.encode())
 
+    def test_all_apple_verification_requirements_are_inline_expressions(self):
+        calls=[]
+        with patch.object(r,'display_code'):
+            r.verify_code(self.app,lambda args,**kw:calls.append(args) or b'')
+        self.assertGreaterEqual(len(calls),2)
+        for args in calls:
+            requirement=args[args.index('-R')+1]
+            self.assertTrue(requirement.startswith('=anchor apple generic'))
+            self.assertIn('certificate leaf[subject.OU] = "'+r.TEAM+'"',requirement)
+            self.assertIn('certificate leaf[field.1.2.840.113635.100.6.1.13] exists',requirement)
+        self.assertIn('identifier "'+r.APP+'"',calls[-1][-2])
+
     def test_notary_rejection_never_staples(self):
         for status in ('Invalid', 'In Progress', 'Rejected', None):
             calls = []
@@ -412,6 +424,12 @@ class ArtifactTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_failure_names_tool_and_status_without_revealing_diagnostics(self):
+        with self.assertRaisesRegex(r.ReleaseError,'status 7') as caught:
+            r.command([sys.executable,'-c','import sys;sys.stderr.write("SYNTHETIC_PRIVATE_MESSAGE");sys.exit(7)'])
+        self.assertIn(Path(sys.executable).name,str(caught.exception))
+        self.assertNotIn('SYNTHETIC_PRIVATE_MESSAGE',str(caught.exception))
+
     def test_captured_input_and_binary_output(self):
         self.assertEqual(r.command([sys.executable,'-c','import sys;sys.stdout.buffer.write(sys.stdin.buffer.read());sys.stderr.write("private")'],input=b'bounded\x00bytes'),b'bounded\x00bytes')
 
