@@ -1,0 +1,9 @@
+{
+  "origin": "https://OWNER_APPROVED_DOWNLOAD_HOST",
+  "account_id": "OWNER_EXPLICIT_ACCOUNT_ID",
+  "database_id": "OWNER_EXPLICIT_D1_DATABASE_ID",
+  "database_name": "owner-explicit-database-name",
+  "bucket_name": "owner-explicit-private-bucket-name",
+  "worker_name": "owner-explicit-worker-name",
+  "wrangler": "/ABSOLUTE/PATH/TO/PREINSTALLED/wrangler"
+}
