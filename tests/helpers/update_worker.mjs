@@ -6,6 +6,13 @@ import {randomBytes,createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import worker from '../../delivery/worker.mjs';
 import {APP,manifest,PART_SIZE,parts} from '../../delivery/contract.mjs';
+// Workers runtime primitive; Node's Fetch implementation does not provide it.
+globalThis.FixedLengthStream ??= class extends TransformStream {
+  constructor(length) {
+    let consumed=0;
+    super({transform(chunk,controller){consumed+=chunk.byteLength;if(consumed>length)throw new Error('length');controller.enqueue(chunk);},flush(){if(consumed!==length)throw new Error('length');}});
+  }
+};
 export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 export function fixture(origin='https://download.example.invalid') {
   const db=new DatabaseSync(':memory:');db.exec(readFileSync(new URL('../../delivery/schema.sql',import.meta.url),'utf8'));
@@ -26,7 +33,8 @@ export function fixture(origin='https://download.example.invalid') {
   const friend=addGrant('friend'),owner=addGrant('owner',true,'qualification'),expired=addGrant('expired',false,'stable',1),revoked=addGrant('revoked');
   db.prepare('UPDATE grants SET revoked_at=1 WHERE grant_id=?').run('revoked');
   let primaryReads=0,assetReads=0;
-  const env={UPDATE_ORIGIN:origin,DB:{withSession(mode){assert.equal(mode,'first-primary');primaryReads++;return{prepare(sql){return{bind(...params){return{async first(){return db.prepare(sql).get(...params)||null;}};}};}};}},ASSETS:{async fetch(request){assetReads++;assert.equal(request.headers.get('Authorization'),null);assert.equal(request.headers.get('Cloudflare-Workers-Version-Overrides'),null);const b=objects.get(new URL(request.url).pathname);return b?new Response(request.method==='HEAD'?null:new ReadableStream({start(controller){controller.enqueue(b);controller.close();}}),{headers:{'Content-Length':String(b.length)}}):new Response(null,{status:404});}}};
+  // The real Static Assets binding may omit Content-Length, including on HEAD.
+  const env={UPDATE_ORIGIN:origin,DB:{withSession(mode){assert.equal(mode,'first-primary');primaryReads++;return{prepare(sql){return{bind(...params){return{async first(){return db.prepare(sql).get(...params)||null;}};}};}};}},ASSETS:{async fetch(request){assetReads++;assert.equal(request.headers.get('Authorization'),null);assert.equal(request.headers.get('Cloudflare-Workers-Version-Overrides'),null);const b=objects.get(new URL(request.url).pathname);return b?new Response(request.method==='HEAD'?null:new ReadableStream({start(controller){controller.enqueue(b);controller.close();}})):new Response(null,{status:404});}}};
   const request=async(path,token=friend,options={})=>{const headers=new Headers(options.headers);if(token)headers.set('Authorization','Bearer '+token);return worker.fetch(new Request(origin+path,{...options,headers}),env);};
   return {db,env,friend,owner,expired,revoked,archive,first,objects,makeRelease,put,partRows,addGrant,request,get primaryReads(){return primaryReads;},get assetReads(){return assetReads;},close(){db.close();}};
 }
@@ -75,6 +83,17 @@ async function run(){
    const second=f.objects.get(mp[1].path);f.objects.delete(mp[1].path);const incomplete=await expect(multiPath,f.friend,200);await assert.rejects(()=>incomplete.arrayBuffer());assertions++;f.objects.set(mp[1].path,second);
    const realAssets=f.env.ASSETS;f.env.ASSETS={fetch:async()=>new Response(null,{status:429})};await expect(archive,f.friend,503);const before=f.assetReads;await expect(archive,f.revoked,401);assert.equal(f.assetReads,before);f.env.ASSETS=realAssets;
    const actualAssets=f.env.ASSETS;
+   for(const headers of [{'Content-Length':String(f.archive.length-1)},{'Content-Length':'invalid'},{'Content-Encoding':'gzip'}]) {
+     let cancelledBody=0;
+     f.env.ASSETS={fetch:async()=>new Response(new ReadableStream({cancel(){cancelledBody++;}}),{headers})};
+     await expect(archive,f.friend,503);assert.equal(cancelledBody,1);assertions++;
+     await expect(archive,f.friend,503,{method:'HEAD'});assertions++;
+   }
+   // Headerless bodies still must match the immutable part's exact byte count.
+   for(const delta of [-1,1]) {
+     f.env.ASSETS={fetch:async()=>new Response(new ReadableStream({start(c){c.enqueue(Buffer.alloc(f.archive.length+delta));c.close();}}))};
+     const broken=await expect(archive,f.friend,200);await assert.rejects(()=>broken.arrayBuffer());assertions++;
+   }
    for(const delta of [-1,1]) {
      f.env.ASSETS={fetch:async()=>new Response(Buffer.alloc(f.archive.length+delta),{headers:{'Content-Length':String(f.archive.length)}})};
      const broken=await expect(archive,f.friend,200);await assert.rejects(()=>broken.arrayBuffer());assertions++;
@@ -91,7 +110,7 @@ async function run(){
    } finally {globalThis.setTimeout=originalTimer;f.env.ASSETS=actualAssets;}
    const realFetch=f.env.ASSETS.fetch;let cancelled=0,streamReads=0;
    f.env.ASSETS.fetch=async req=>{const response=await realFetch(req);return new Response(new ReadableStream({pull(c){streamReads++;c.enqueue(Buffer.from([1]));},cancel(){cancelled++;}}),{headers:response.headers});};
-   const cancelResponse=await expect(archive,f.friend,200);assert.equal(streamReads,1);await cancelResponse.body.cancel();assert.equal(cancelled,1);f.env.ASSETS.fetch=realFetch;assertions++;
+   const cancelResponse=await expect(archive,f.friend,200);assert(streamReads<=2);await cancelResponse.body.cancel();await new Promise(resolve=>setTimeout(resolve,0));assert.equal(cancelled,1);f.env.ASSETS.fetch=realFetch;assertions++;
    f.db.prepare('UPDATE grants SET revoked_at=? WHERE grant_id=?').run(Math.floor(Date.now()/1000),'friend');
    await expect(archive,f.friend,401);await expect(pkg,f.friend,401,{method:'HEAD'});
    const good=f.env.DB;f.env.DB={withSession(){throw new Error('private database failure');}};

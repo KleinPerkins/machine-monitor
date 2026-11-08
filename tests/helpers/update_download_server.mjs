@@ -7,11 +7,11 @@ const pending=new Set();
 const realFetch=f.env.ASSETS.fetch.bind(f.env.ASSETS);
 f.env.ASSETS.fetch=async request=>{
   const response=await realFetch(request);if(response.status!==200||request.method==='HEAD')return response;
-  const size=Number(response.headers.get('Content-Length'));
+  const bytes=f.objects.get(new URL(request.url).pathname),size=bytes.length;
   if(mode==='tamper')return new Response(Buffer.alloc(size,1),{headers:response.headers});
   if(mode==='short')return new Response(Buffer.alloc(size-1,1),{headers:{'Content-Length':String(size-1)}});
   if(mode==='slow'){
-    const bytes=f.objects.get(new URL(request.url).pathname);let timer;
+    let timer;
     return new Response(new ReadableStream({start(c){c.enqueue(bytes.subarray(0,3));timer=setTimeout(()=>{pending.delete(timer);c.enqueue(bytes.subarray(3));c.close();},1500);pending.add(timer);},cancel(){clearTimeout(timer);pending.delete(timer);aborted++;}}),{headers:response.headers});
   }
   return response;
