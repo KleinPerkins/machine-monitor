@@ -27,6 +27,9 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = 'com.kleinperkins.machine-monitor'
 WRANGLER = '4.158.0'
 MAX_ARCHIVE = 512 * 1024 * 1024
+PART_SIZE = 20 * 1024 * 1024
+MAX_FILES = 20000
+FREE_PROOF_MAX_AGE = 3600
 CHECKS = ('ci_required', 'merged_source', 'developer_id', 'notarization',
           'stapled_ticket', 'gatekeeper', 'archive_signature', 'recovery_packaged')
 
@@ -46,6 +49,8 @@ def bounded_json(path, maximum=65536):
 
 
 def outside_git(path):
+    if not Path(path).is_absolute():
+        raise DeliveryError('Private paths must be explicit absolute canonical paths.')
     path = Path(path).absolute()
     if path != path.resolve():
         raise DeliveryError('Private files must use canonical paths without symlinks.')
@@ -84,7 +89,7 @@ def load_config(path):
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
         raise DeliveryError('Private configuration must be an owner-owned mode-0600 regular file.')
     config = bounded_json(path)
-    required = {'origin', 'account_id', 'database_id', 'database_name', 'bucket_name', 'worker_name', 'wrangler'}
+    required = {'origin', 'account_id', 'database_id', 'database_name', 'worker_name', 'wrangler', 'assets_directory', 'free_plan_proof', 'deployment_state'}
     if set(config) != required:
         raise DeliveryError('Private configuration keys do not match the template.')
     parsed = urllib.parse.urlsplit(config['origin'])
@@ -94,13 +99,115 @@ def load_config(path):
         raise DeliveryError('Select a canonical HTTPS download hostname (default port).')
     if not re.fullmatch(r'[a-f0-9]{32}', config['account_id']) or not re.fullmatch(r'[a-f0-9-]{36}', config['database_id']):
         raise DeliveryError('Invalid explicit account/database binding.')
-    for key in ('database_name', 'bucket_name', 'worker_name'):
+    for key in ('database_name', 'worker_name'):
         if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}', config[key]):
             raise DeliveryError('Invalid private resource name.')
     binary = Path(config['wrangler'])
     if not binary.is_absolute() or not binary.is_file():
         raise DeliveryError('Configure the absolute path of preinstalled pinned Wrangler.')
+    private_directory(config['assets_directory'])
+    outside_git(config['free_plan_proof'])
+    outside_git(config['deployment_state'])
     return config
+
+
+def private_json(path):
+    path = outside_git(path)
+    info = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+        raise DeliveryError('Private evidence must be an owner-owned mode-0600 regular file.')
+    return bounded_json(path, 16 * 1024 * 1024)
+
+
+def require_free(config, now=None):
+    # An explicit owner observation, not an independent provider/API assertion.
+    try:
+        proof = private_json(config['free_plan_proof'])
+        current = int(time.time()) if now is None else now
+        if (set(proof) != {'schema', 'account_id', 'observed_plan', 'source', 'source_reference', 'observed_at', 'expires_at'} or
+            proof['schema'] != 'machine-monitor/free-plan-observation/v1' or
+            proof['account_id'] != config['account_id'] or proof['observed_plan'] != 'Workers Free' or
+            proof['source'] != 'owner-dashboard-observation' or
+            not isinstance(proof['source_reference'], str) or not 1 <= len(proof['source_reference'].strip()) <= 512 or
+            type(proof['observed_at']) is not int or type(proof['expires_at']) is not int or
+            not proof['observed_at'] <= current < proof['expires_at'] or
+            not 0 < proof['expires_at'] - proof['observed_at'] <= FREE_PROOF_MAX_AGE):
+            raise DeliveryError('Current account-bound Workers Free owner observation required; no operation performed.')
+    except (OSError, KeyError, ValueError, TypeError):
+        raise DeliveryError('Current account-bound Workers Free owner observation required; no operation performed.') from None
+    return proof
+
+
+def private_directory(path):
+    root = outside_git(path)
+    info = root.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise DeliveryError('Assets require an explicit owner-owned mode-0700 directory outside Git.')
+    return root
+
+
+def asset_inventory(config):
+    root = private_directory(config['assets_directory'])
+    inventory = {}
+    for path in root.rglob('*'):
+        info = path.lstat()
+        if path.is_symlink() or info.st_uid != os.getuid():
+            raise DeliveryError('Asset symlinks/foreign ownership are forbidden.')
+        if path.is_dir():
+            if stat.S_IMODE(info.st_mode) != 0o700:
+                raise DeliveryError('Private asset directories must have mode 0700.')
+            continue
+        relative = '/' + path.relative_to(root).as_posix()
+        pattern = r'/_private/' + re.escape(APP) + r'/[A-Za-z0-9_-]{1,128}/(?:archive|package)/[a-f0-9]{64}/(?:0|[1-9][0-9]?)-([a-f0-9]{64})\.part'
+        match = re.fullmatch(pattern, relative)
+        if (not match or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or
+            not 0 < info.st_size <= PART_SIZE):
+            raise DeliveryError('Only bounded private immutable part files may be deployed; no routing/control files.')
+        digest, size = file_digest(path)
+        if digest != match[1]:
+            raise DeliveryError('Retained asset hash mismatch.')
+        inventory[relative] = {'sha256': digest, 'size': size}
+        if len(inventory) > MAX_FILES:
+            raise DeliveryError('Complete retained asset set exceeds Workers Free file-count bound.')
+    return inventory
+
+
+def stage_artifact(config, source, release_id, kind, descriptor):
+    require_free(config)
+    if (not isinstance(descriptor, dict) or not re.fullmatch(r'[a-f0-9]{64}', descriptor.get('sha256', '')) or
+        type(descriptor.get('size')) is not int or not 0 < descriptor['size'] <= MAX_ARCHIVE):
+        raise DeliveryError('Invalid bounded artifact descriptor.')
+    root = private_directory(config['assets_directory'])
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', release_id) or kind not in ('archive', 'package'):
+        raise DeliveryError('Invalid immutable artifact identity.')
+    parts, digest, total = [], hashlib.sha256(), 0
+    with Path(source).open('rb') as stream:
+        while chunk := stream.read(PART_SIZE):
+            total += len(chunk)
+            if total > MAX_ARCHIVE:
+                raise DeliveryError('Archive exceeds the delivery bound.')
+            digest.update(chunk)
+            part_hash = hashlib.sha256(chunk).hexdigest()
+            path = f'/_private/{APP}/{release_id}/{kind}/{descriptor["sha256"]}/{len(parts)}-{part_hash}.part'
+            destination = root / path.lstrip('/')
+            directory = root
+            for component in destination.relative_to(root).parts[:-1]:
+                directory = directory / component
+                if not directory.exists(): directory.mkdir(mode=0o700)
+                info = directory.lstat()
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                    raise DeliveryError('Asset directory ownership/mode/symlink refused.')
+            if destination.exists():
+                if file_digest(destination) != (part_hash, len(chunk)):
+                    raise DeliveryError('Existing immutable part differs.')
+            else:
+                fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, 'wb') as target:
+                    target.write(chunk); target.flush(); os.fsync(target.fileno())
+            parts.append(dict(index=len(parts), path=path, size=len(chunk), sha256=part_hash))
+    if (digest.hexdigest(), total) != (descriptor['sha256'], descriptor['size']):
+        raise DeliveryError('Archive hash or length differs from the qualified manifest.')
+    return parts
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -111,6 +218,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 class Cloudflare:
     def __init__(self, config):
         self.config = config
+        pinned_node()
         # Keep HOME/auth unchanged. Never run login or activate a plan here.
         version = self.wrangler('--version').strip()
         if version != WRANGLER:
@@ -124,7 +232,24 @@ class Cloudflare:
         self._authorization = 'Bearer ' + auth['token']
         self._opener = urllib.request.build_opener(NoRedirect)
 
+    def require_free(self):
+        return require_free(self.config)
+
     def wrangler(self, *args, timeout=60):
+        if args not in (('--version',), ('auth', 'token', '--json')):
+            self.require_free()
+            if len(args) != 3 or args[:2] != ('deploy', '--config'):
+                raise DeliveryError('Only the fixed Free-only deployment command is supported.')
+            configured = private_json(args[2])
+            validate_deployment_config(configured)
+            if configured != deployment_config(self.config, self):
+                raise DeliveryError('Deployment bindings differ from the explicit private configuration.')
+            state_path = outside_git(self.config['deployment_state'])
+            if state_path.exists():
+                audit_deployment(self, require_current_source=False)
+            elif self.api('/workers/scripts/' + self.config['worker_name'] + '/deployments', allow_not_found=True) is not None:
+                raise DeliveryError('Existing Worker has no known private deployment receipt.')
+            self.preflight_retention(asset_inventory(self.config))
         # Capture all output: even upstream diagnostics must never expose credentials.
         environment = dict(os.environ, WRANGLER_SEND_METRICS='false', WRANGLER_SEND_ERROR_REPORTS='false',
                            WRANGLER_WRITE_LOGS='false', WRANGLER_LOG='log', WRANGLER_LOG_SANITIZE='true',
@@ -143,8 +268,19 @@ class Cloudflare:
             raise DeliveryError('Pinned Wrangler operation failed. Check owner authentication/resource permissions privately.')
         return result.stdout.decode('utf-8')
 
-    def api(self, suffix, body=None, method=None):
+    def api(self, suffix, body=None, method=None, *, allow_not_found=False):
+        effective_method = method or ('POST' if body is not None else 'GET')
+        # D1 query uses POST even for SELECT; conservatively guard every POST.
+        if effective_method != 'GET':
+            self.require_free()
+            allowed = (suffix == '/d1/database' and effective_method == 'POST' and isinstance(body, dict) and set(body) == {'name'}) or (suffix == '/workers/subdomain' and effective_method == 'PUT' and isinstance(body, dict) and set(body) == {'subdomain'}) or bool(re.fullmatch(r'/d1/database/[a-f0-9-]{36}/query', suffix) and effective_method == 'POST')
+            if not allowed:
+                raise DeliveryError('Provider mutation is outside the fixed Free-only interface.')
+        if not suffix.startswith('/') or '?' in suffix or '#' in suffix or '..' in suffix:
+            raise DeliveryError('Invalid account API path.')
         account = self.config['account_id']
+        if not isinstance(account, str) or not re.fullmatch(r'[a-f0-9]{32}', account):
+            raise DeliveryError('Invalid explicit account identity.')
         url = 'https://api.cloudflare.com/client/v4/accounts/' + account + suffix
         payload = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(url, data=payload, method=method or ('POST' if body is not None else 'GET'),
@@ -158,6 +294,11 @@ class Cloudflare:
             if parsed.get('success') is not True:
                 raise DeliveryError('Cloudflare refused the operation.')
             return parsed['result']
+        except urllib.error.HTTPError as error:
+            if (allow_not_found and error.code == 404 and effective_method == 'GET' and
+                re.fullmatch(r'/workers/scripts/[a-z0-9][a-z0-9_-]{0,62}/deployments', suffix)):
+                return None
+            raise DeliveryError('Cloudflare API operation failed; no public fallback was used.') from None
         except (urllib.error.URLError, ValueError, KeyError):
             raise DeliveryError('Cloudflare API operation failed; no public fallback was used.') from None
 
@@ -167,27 +308,195 @@ class Cloudflare:
             raise DeliveryError('D1 query failed.')
         return result[-1].get('results', [])
 
+    def zone_routes(self):
+        # Zone routes are distinct from account custom domains. Enumerate every
+        # account-owned zone, including pages, and refuse any route to this Worker.
+        routes = []
+        for page in range(1, 101):
+            query = urllib.parse.urlencode({'account.id': self.config['account_id'], 'per_page': 50, 'page': page})
+            zones = self._zone_read('/zones?' + query)
+            if not isinstance(zones, list) or len(zones) > 50:
+                raise DeliveryError('Account zone inventory is unknown.')
+            for zone in zones:
+                identity = zone.get('id')
+                if not isinstance(identity, str) or not re.fullmatch(r'[a-f0-9]{32}', identity):
+                    raise DeliveryError('Invalid account zone identity.')
+                found = self._zone_read('/zones/' + identity + '/workers/routes')
+                if not isinstance(found, list): raise DeliveryError('Zone route inventory is unknown.')
+                routes.extend(found)
+            if len(zones) < 50: return routes
+        raise DeliveryError('Zone inventory exceeds the bounded read limit.')
+
+    def _zone_read(self, suffix):
+        # Internal read-only path; account/auth stay unchanged and redirects deny.
+        listing = '/zones?' + urllib.parse.urlencode({'account.id': self.config['account_id'], 'per_page': 50, 'page': 1})
+        if not (re.fullmatch(r'/zones/[a-f0-9]{32}/workers/routes', suffix) or
+                re.fullmatch(re.escape(listing.rsplit('=', 1)[0]) + r'=(?:[1-9][0-9]?|100)', suffix)):
+            raise DeliveryError('Unsupported zone read.')
+        request = urllib.request.Request('https://api.cloudflare.com/client/v4' + suffix,
+                                         headers={'Authorization': self._authorization})
+        try:
+            with self._opener.open(request, timeout=30) as response:
+                data = response.read(2 * 1024 * 1024 + 1)
+            if len(data) > 2 * 1024 * 1024: raise DeliveryError('Zone inventory too large.')
+            result = json.loads(data)
+            if result.get('success') is not True: raise DeliveryError('Zone inventory unavailable.')
+            return result['result']
+        except (OSError, ValueError, KeyError):
+            raise DeliveryError('Fail-closed route readback is unavailable.') from None
+
+    def create_database(self, name):
+        self.require_free()
+        if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}', name): raise DeliveryError('Invalid database name.')
+        databases = self.api('/d1/database')
+        if not isinstance(databases, list) or len(databases) >= 10 or any(d.get('name') == name for d in databases):
+            raise DeliveryError('Explicit new Free database requires known available capacity and a unique name.')
+        return self.api('/d1/database', {'name': name}, 'POST')
+
+    def create_subdomain(self, name):
+        self.require_free()
+        if not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', name): raise DeliveryError('Invalid subdomain.')
+        current = self.api('/workers/subdomain')
+        if current.get('subdomain'):
+            raise DeliveryError('Existing subdomain must be retained; no replacement is supported.')
+        return self.api('/workers/subdomain', {'subdomain': name}, 'PUT')
+
     def privacy(self):
-        base = '/r2/buckets/' + self.config['bucket_name'] + '/domains/'
-        managed = self.api(base + 'managed')
-        custom = self.api(base + 'custom')
-        if managed.get('enabled') is not False or custom.get('domains') != []:
-            raise DeliveryError('R2 must have r2.dev disabled and no custom domains. No settings were changed.')
+        return audit_deployment(self)
 
-    def put_checked(self, snapshot, key, digest):
-        # Content-addressed names are never used for different bytes. Readback is
-        # mandatory before D1 publication; R2 is strongly consistent.
-        object_path = self.config['bucket_name'] + '/' + key
-        self.wrangler('r2', 'object', 'put', object_path, '--remote', '--file', str(snapshot), timeout=300)
-        self.readback(key, digest, snapshot.stat().st_size)
+    def preflight_retention(self, inventory):
+        path = outside_git(self.config['deployment_state'])
+        if path.exists():
+            prior = private_json(path)
+            for name, details in prior['assets'].items():
+                if inventory.get(name) != details:
+                    raise DeliveryError('Deployment would drop/change retained parts.')
+        for row in self.query('SELECT parts_json FROM artifact_parts'):
+            for part in json.loads(row['parts_json']):
+                if inventory.get(part['path']) != {k: part[k] for k in ('sha256', 'size')}:
+                    raise DeliveryError('Deployment would drop/change published or rollback parts.')
 
-    def readback(self, key, digest, size):
-        object_path = self.config['bucket_name'] + '/' + key
-        with tempfile.TemporaryDirectory(prefix='monitor-readback-') as folder:
-            downloaded = Path(folder) / 'artifact.zip'
-            self.wrangler('r2', 'object', 'get', object_path, '--remote', '--file', str(downloaded), timeout=300)
-            if file_digest(downloaded) != (digest, size):
-                raise DeliveryError('R2 readback hash/length mismatch; release was not published.')
+    def deploy(self):
+        self.require_free()
+        configured = deployment_config(self.config, self)
+        inventory = asset_inventory(self.config)
+        state_path = outside_git(self.config['deployment_state'])
+        prior = private_json(state_path) if state_path.exists() else None
+        if not prior:
+            existing = self.api('/workers/scripts/' + self.config['worker_name'] + '/deployments', allow_not_found=True)
+            if existing is not None:
+                raise DeliveryError('An existing Worker without its private deployment receipt must be investigated; no replacement performed.')
+        if prior:
+            audit_deployment(self, require_current_source=False)
+            for path, details in prior['assets'].items():
+                if inventory.get(path) != details:
+                    raise DeliveryError('Deployment would drop/change previously retained parts; no deletion is supported.')
+        # Additive schema only, after all local/config/Free gates.
+        self.query((ROOT / 'delivery/schema.sql').read_text())
+        for row in self.query('SELECT parts_json FROM artifact_parts'):
+            for part in json.loads(row['parts_json']):
+                if inventory.get(part['path']) != {k: part[k] for k in ('sha256', 'size')}:
+                    raise DeliveryError('Deployment would drop/change published or rollback parts.')
+        with tempfile.TemporaryDirectory(prefix='monitor-deploy-') as folder:
+            filename = Path(folder).resolve() / 'wrangler.json'
+            private_write(filename, configured)
+            output = self.wrangler('deploy', '--config', str(filename), timeout=300)
+        match = re.search(r'Current Version ID:\s*([a-f0-9-]{36})', output)
+        if not match:
+            raise DeliveryError('Deployment version identity unavailable; publication blocked pending private investigation.')
+        version_id = match[1]
+        base = '/workers/scripts/' + self.config['worker_name']
+        deployed = current_version(self.api(base + '/deployments'))
+        if deployed != version_id:
+            raise DeliveryError('Deployment is not the single reviewed version at 100 percent.')
+        detail = self.api(base + '/versions/' + version_id)
+        etag = detail.get('resources', {}).get('script', {}).get('etag')
+        if not isinstance(etag, str) or not etag:
+            raise DeliveryError('Provider version source identity unavailable.')
+        state = dict(schema='machine-monitor/private-deployment/v1', account_id=self.config['account_id'],
+                     worker_name=self.config['worker_name'], version_id=version_id, etag=etag,
+                     source_sha256=source_digest(), config=configured, assets=inventory)
+        # Atomically replace only this tool's explicit state file, never asset data.
+        temporary = state_path.with_name(state_path.name + '.' + secrets.token_hex(8))
+        private_write(temporary, state)
+        os.replace(temporary, state_path)
+        audit_deployment(self)
+
+    def readback(self, release_id, descriptor, kind):
+        # Owner-only short-lived qualification grant stays in process memory.
+        self.require_free()
+        token, grant = secrets.token_urlsafe(32), str(uuid.uuid4())
+        now = int(time.time())
+        self.query('INSERT INTO grants(grant_id,token_hash,label,is_owner,expires_at,created_at) VALUES(?,?,?,?,?,?)',
+                   (grant, hashlib.sha256(token.encode()).hexdigest(), 'publication-readback', 1, now + 600, now))
+        try:
+            self.query('INSERT INTO entitlements(grant_id,app_id,channel) VALUES(?,?,?)', (grant, APP, 'qualification'))
+            path = f'/v1/apps/{APP}/releases/{release_id}/{kind}'
+            request = urllib.request.Request(self.config['origin'] + path, headers={'Authorization': 'Bearer ' + token})
+            digest, size = hashlib.sha256(), 0
+            try:
+                with self._opener.open(request, timeout=30) as response:
+                    if response.status != 200 or response.headers.get('Content-Length') != str(descriptor['size']):
+                        raise DeliveryError('Private remote readback failed.')
+                    while chunk := response.read(1024 * 1024):
+                        size += len(chunk)
+                        if size > descriptor['size']: raise DeliveryError('Remote readback length exceeded.')
+                        digest.update(chunk)
+            except (OSError, urllib.error.URLError):
+                raise DeliveryError('Private remote readback failed; channel was not advanced.') from None
+            if (digest.hexdigest(), size) != (descriptor['sha256'], descriptor['size']):
+                raise DeliveryError('Remote readback hash/length mismatch; channel was not advanced.')
+        finally:
+            self.query('UPDATE grants SET revoked_at=? WHERE grant_id=?', (int(time.time()), grant))
+
+
+def source_digest():
+    digest = hashlib.sha256()
+    for name in ('worker.mjs', 'contract.mjs', 'web.mjs'):
+        digest.update(name.encode()); digest.update((ROOT / 'delivery' / name).read_bytes())
+    return digest.hexdigest()
+
+
+def current_version(deployments):
+    entries = deployments.get('deployments') if isinstance(deployments, dict) else None
+    if not isinstance(entries, list) or not entries:
+        raise DeliveryError('Current active deployment is unknown.')
+    versions = entries[0].get('versions')
+    # Include 0-percent versions: caller version overrides can select them.
+    if not isinstance(versions, list) or len(versions) != 1 or versions[0].get('percentage') != 100:
+        raise DeliveryError('Require exactly one reviewed active version at 100 percent, including zero-percent entries.')
+    version = versions[0].get('version_id')
+    if not isinstance(version, str) or not re.fullmatch(r'[a-f0-9-]{36}', version):
+        raise DeliveryError('Invalid deployed version identity.')
+    return version
+
+
+def audit_deployment(api, require_current_source=True):
+    config = api.config
+    require_free(config)
+    state = private_json(config['deployment_state'])
+    expected = deployment_config(config, api)
+    if (state.get('schema') != 'machine-monitor/private-deployment/v1' or state.get('account_id') != config['account_id'] or
+        state.get('worker_name') != config['worker_name'] or (require_current_source and state.get('source_sha256') != source_digest()) or state.get('config') != expected):
+        raise DeliveryError('Deployment does not match this exact reviewed source/configuration.')
+    base = '/workers/scripts/' + config['worker_name']
+    version = current_version(api.api(base + '/deployments'))
+    if version != state.get('version_id'):
+        raise DeliveryError('Unrecognized active version; publication blocked.')
+    detail = api.api(base + '/versions/' + version)
+    if detail.get('resources', {}).get('script', {}).get('etag') != state.get('etag'):
+        raise DeliveryError('Active version source readback mismatch.')
+    subdomain = api.api(base + '/subdomain')
+    if subdomain.get('enabled') is not True or subdomain.get('previews_enabled') is not False:
+        raise DeliveryError('Default/preview route configuration is unsafe or unknown.')
+    # The supported workers.dev-only profile cannot have custom routes/domains.
+    domains = api.api('/workers/domains')
+    if not isinstance(domains, list) or any(d.get('service') == config['worker_name'] for d in domains):
+        raise DeliveryError('Custom routes/domains require separately qualified fail-closed routing.')
+    routes = api.zone_routes()
+    if not isinstance(routes, list) or any(r.get('script') == config['worker_name'] for r in routes):
+        raise DeliveryError('Any custom zone route requires separately qualified fail-closed routing.')
+    return state
 
 
 def file_digest(path):
@@ -201,13 +510,21 @@ def file_digest(path):
     return digest.hexdigest(), size
 
 
-def validate_manifest(value):
-    # Run the actual wire validator, not a second divergent Python implementation.
+def pinned_node():
     binary = os.environ.get('MONITOR_NODE', 'node')
     try:
         version = subprocess.run([binary, '--version'], capture_output=True, check=True, timeout=10).stdout.strip()
         if version != b'v26.4.0':
-            raise DeliveryError('Node must be exactly 26.4.0 for contract validation.')
+            raise DeliveryError('Node must be exactly 26.4.0.')
+    except (OSError, subprocess.SubprocessError):
+        raise DeliveryError('Pinned Node runtime unavailable.') from None
+    return binary
+
+
+def validate_manifest(value):
+    # Run the actual wire validator, not a second divergent Python implementation.
+    binary = pinned_node()
+    try:
         script = "import {manifest} from './delivery/contract.mjs'; let s=''; for await(const c of process.stdin)s+=c; manifest(JSON.parse(s));"
         result = subprocess.run([binary, '--input-type=module', '-e', script], input=json.dumps(value).encode(),
                                 capture_output=True, cwd=ROOT, timeout=10)
@@ -231,6 +548,7 @@ def validate_receipt(manifest, receipt, stable=False):
 
 
 def create_grant(api, config, label, output, expires_at, owner=False, channel='stable'):
+    api.require_free()
     output = outside_git(output)
     if output.exists() or not re.fullmatch(r'[A-Za-z0-9._-]{1,64}', label):
         raise DeliveryError('Use a new access-file path and an opaque non-personal label.')
@@ -250,43 +568,36 @@ def create_grant(api, config, label, output, expires_at, owner=False, channel='s
 
 
 def publish(api, value, receipt, archive=None, package=None):
+    api.require_free()
     value = validate_manifest(value)
     stable = value['channel'] == 'stable'
     validate_receipt(value, receipt, stable)
-    api.privacy()
     release_id = value['archive']['path'].split('/')[-2]
-    if value['first_install']['path'].split('/')[-2] != release_id:
-        raise DeliveryError('Package and update must share the exact release identity.')
+    prepared = []
     if stable:
+        api.privacy()
         rows = api.query("SELECT manifest_json FROM releases WHERE app_id=? AND release_id=? AND channel='qualification'", (APP, release_id))
         if len(rows) != 1:
             raise DeliveryError('Publish and privately qualify this exact qualification release first.')
         prior = json.loads(rows[0]['manifest_json'])
-        expected = dict(value, channel='qualification', qualified=prior['qualified'])
-        if prior != expected:
+        if prior != dict(value, channel='qualification', qualified=prior['qualified']):
             raise DeliveryError('Stable promotion must preserve the exact qualification manifest and hashes.')
         if archive or package:
             raise DeliveryError('Promotion reuses qualified bytes; do not supply new archives.')
-        for descriptor, suffix in ((value['archive'], '.zip'), (value['first_install'], '.package.zip')):
-            api.readback(APP + '/' + descriptor['sha256'] + suffix, descriptor['sha256'], descriptor['size'])
+        for kind, descriptor in (('archive', value['archive']), ('package', value['first_install'])):
+            api.readback(release_id, descriptor, kind)
     else:
         if not archive or not package:
             raise DeliveryError('Qualification publication requires both update and first-install archives.')
-        with tempfile.TemporaryDirectory(prefix='monitor-publish-') as folder:
-            for descriptor, source, suffix in ((value['archive'], archive, '.zip'), (value['first_install'], package, '.package.zip')):
-                snapshot = Path(folder) / ('artifact' + suffix)
-                with Path(source).open('rb') as original, snapshot.open('xb') as target:
-                    os.chmod(snapshot, 0o600)
-                    # Bounded streaming snapshot prevents a later source-path swap.
-                    size = 0
-                    while chunk := original.read(1024 * 1024):
-                        size += len(chunk)
-                        if size > MAX_ARCHIVE:
-                            raise DeliveryError('Archive exceeds the delivery bound.')
-                        target.write(chunk)
-                if file_digest(snapshot) != (descriptor['sha256'], descriptor['size']):
-                    raise DeliveryError('Archive hash or length differs from the qualified manifest.')
-                api.put_checked(snapshot, APP + '/' + descriptor['sha256'] + suffix, descriptor['sha256'])
+        for descriptor, source, kind in ((value['archive'], archive, 'archive'), (value['first_install'], package, 'package')):
+            prepared.append((kind, descriptor, stage_artifact(api.config, source, release_id, kind, descriptor)))
+        api.deploy()  # complete retained set BEFORE any release/channel publication
+        for kind, descriptor, parts in prepared:
+            serialized_parts = json.dumps(parts, sort_keys=True, separators=(',', ':'))
+            api.query('INSERT OR IGNORE INTO artifact_parts VALUES(?,?,?,?,?)', (APP, release_id, kind, descriptor['sha256'], serialized_parts))
+            existing = api.query('SELECT parts_json FROM artifact_parts WHERE app_id=? AND release_id=? AND kind=? AND artifact_sha256=?', (APP, release_id, kind, descriptor['sha256']))
+            if len(existing) != 1 or existing[0]['parts_json'] != serialized_parts:
+                raise DeliveryError('Immutable part identity already differs.')
     serialized = json.dumps(value, sort_keys=True, separators=(',', ':'))
     api.query('INSERT OR IGNORE INTO releases(app_id,release_id,channel,manifest_json,archive_sha256,archive_size,object_key,qualification_id,evidence_json) VALUES(?,?,?,?,?,?,?,?,?)',
         (APP, release_id, value['channel'], serialized, value['archive']['sha256'], value['archive']['size'],
@@ -294,6 +605,12 @@ def publish(api, value, receipt, archive=None, package=None):
     existing = api.query('SELECT manifest_json FROM releases WHERE app_id=? AND release_id=? AND channel=?', (APP, release_id, value['channel']))
     if len(existing) != 1 or existing[0]['manifest_json'] != serialized:
         raise DeliveryError('Immutable release identity already contains different metadata.')
+    # Qualification row is reachable by owner before its channel advances.
+    api.privacy()
+    if not stable:
+        for kind, descriptor in (('archive', value['archive']), ('package', value['first_install'])):
+            api.readback(release_id, descriptor, kind)
+    api.require_free()
     api.query('''INSERT INTO channels(app_id,channel,release_id) VALUES(?,?,?)
         ON CONFLICT(app_id,channel) DO UPDATE SET release_id=excluded.release_id
         WHERE CAST(json_extract((SELECT manifest_json FROM releases WHERE app_id=excluded.app_id AND channel=excluded.channel AND release_id=excluded.release_id),'$.build') AS INTEGER)
@@ -305,6 +622,9 @@ def publish(api, value, receipt, archive=None, package=None):
 
 
 def deployment_config(config, api=None):
+    parsed = urllib.parse.urlsplit(config['origin'])
+    if parsed.scheme != 'https' or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment or parsed.netloc != parsed.hostname:
+        raise DeliveryError('Select a canonical HTTPS download hostname.')
     result = json.loads((ROOT / 'delivery/wrangler.template.json').read_text())
     result.update(name=config['worker_name'], main=str(ROOT / 'delivery/worker.mjs'), account_id=config['account_id'])
     hostname = urllib.parse.urlsplit(config['origin']).hostname
@@ -322,13 +642,21 @@ def deployment_config(config, api=None):
         result['workers_dev'] = True
         result['routes'] = []
     else:
-        result['workers_dev'] = False
-        result['routes'] = [{'pattern': hostname, 'custom_domain': True}]
+        raise DeliveryError('Custom routes require separately qualified fail-closed routing; use exact account-owned workers.dev.')
     result['preview_urls'] = False
     result['vars'] = {'UPDATE_ORIGIN': config['origin']}
     result['d1_databases'] = [{'binding': 'DB', 'database_name': config['database_name'], 'database_id': config['database_id']}]
-    result['r2_buckets'] = [{'binding': 'ARCHIVES', 'bucket_name': config['bucket_name']}]
+    result['assets'] = {'directory': str(private_directory(config['assets_directory'])), 'binding': 'ASSETS', 'run_worker_first': True, 'html_handling': 'none', 'not_found_handling': 'none'}
+    validate_deployment_config(result)
     return result
+
+
+def validate_deployment_config(value):
+    allowed = {'name', 'main', 'account_id', 'compatibility_date', 'workers_dev', 'preview_urls', 'observability', 'routes', 'vars', 'd1_databases', 'assets'}
+    if (set(value) != allowed or value.get('workers_dev') is not True or value.get('preview_urls') is not False or value.get('routes') != [] or
+        value.get('observability') != {'enabled': False} or
+        value.get('assets') != {'directory': value.get('assets', {}).get('directory'), 'binding': 'ASSETS', 'run_worker_first': True, 'html_handling': 'none', 'not_found_handling': 'none'}):
+        raise DeliveryError('Only unconditional worker-first private static assets with no routing fallback are supported.')
 
 
 def main():
@@ -364,18 +692,9 @@ def main():
             print('Grant revoked. Subsequent requests will be denied; already downloaded bytes remain available.')
         elif args.command == 'check-privacy':
             api.privacy()
-            print('R2 public access disabled; no bucket custom domains.')
+            print('Exact reviewed active version, private origin and preview restrictions verified; live quota/upgrade qualification remains separate.')
         elif args.command == 'deploy':
-            api.privacy()
-            # Ownership/configuration must pass before any deployment/schema write.
-            configured = deployment_config(config, api)
-            # Explicit existing resources only. No create/upgrade/pay command exists.
-            api.query((ROOT / 'delivery/schema.sql').read_text())
-            with tempfile.TemporaryDirectory(prefix='monitor-deploy-') as folder:
-                filename = Path(folder).resolve() / 'wrangler.json'
-                private_write(filename, configured)
-                api.wrangler('deploy', '--config', str(filename), timeout=180)
-            api.privacy()
+            api.deploy()
             print('Worker deployment completed. Binary publication and live qualification remain separate.')
         else:
             publish(api, bounded_json(args.manifest), bounded_json(args.receipt), args.archive, args.package)

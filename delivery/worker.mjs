@@ -1,4 +1,4 @@
-import {APP, TOKEN, ID, origin, manifest, sha256} from './contract.mjs';
+import {APP, TOKEN, ID, origin, manifest, sha256, parts} from './contract.mjs';
 import {PAGE, CLIENT} from './web.mjs';
 const POLICY = {
   'Cache-Control':'private, no-store, max-age=0', 'CDN-Cache-Control':'no-store',
@@ -11,6 +11,52 @@ const POLICY = {
 };
 const reply = (value, status=200, headers={}) => new Response(JSON.stringify(value), {status, headers:{...POLICY,'Content-Type':'application/json',...headers}});
 const deny = () => reply({error:'access_denied'},401);
+const READ_MS=30000;
+async function timed(operation, cancel=()=>{}) {
+  let timer;
+  try {return await Promise.race([operation,new Promise((_,reject)=>{timer=setTimeout(()=>{cancel();reject(new Error('timeout'));},READ_MS);})]);}
+  finally {clearTimeout(timer);}
+}
+async function asset(env, approved, part, method, signal) {
+  // Construct a fresh internal request: never forward bearer/override/cookie headers.
+  const abort=new AbortController();
+  const cancel=()=>abort.abort(); signal?.addEventListener('abort',cancel,{once:true});
+  try {
+    if(signal?.aborted)throw new Error('cancelled');
+    const response=await timed(env.ASSETS.fetch(new Request(approved+part.path,{method,signal:abort.signal})),cancel);
+    if(response.status!==200 || response.headers.get('Content-Length')!==String(part.size) || response.headers.get('Content-Encoding')) {
+      await response.body?.cancel();throw new Error('asset');
+    }
+    return response;
+  }finally {signal?.removeEventListener('abort',cancel);}
+}
+async function multipart(env, approved, ordered, signal) {
+  // Fetch headers for the first part before sending success; later failures abort
+  // the response. The unchanged complete-artifact client hash/signature rejects it.
+  let index=0, consumed=0, reader=(await asset(env,approved,ordered[0],'GET',signal)).body?.getReader();
+  if(!reader)throw new Error('asset');
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        while(true) {
+          if(signal?.aborted)throw new Error('cancelled');
+          const item=await timed(reader.read(),()=>{reader.cancel().catch(()=>{});});
+          if(item.done) {
+            if(consumed!==ordered[index].size)throw new Error('length');
+            reader.releaseLock();reader=null;index++;consumed=0;
+            if(index===ordered.length){controller.close();return;}
+            reader=(await asset(env,approved,ordered[index],'GET',signal)).body?.getReader();
+            if(!reader)throw new Error('asset');
+            continue;
+          }
+          if(!item.value?.byteLength || consumed+item.value.byteLength>ordered[index].size)throw new Error('length');
+          consumed+=item.value.byteLength;controller.enqueue(item.value);return;
+        }
+      } catch {if(reader){await reader.cancel().catch(()=>{});reader.releaseLock();reader=null;}controller.error(new Error('incomplete artifact'));}
+    },
+    async cancel(){if(reader){await reader.cancel().catch(()=>{});reader.releaseLock();reader=null;}}
+  },{highWaterMark:0});
+}
 const auth = `FROM grants g JOIN entitlements e ON e.grant_id=g.grant_id
  WHERE g.token_hash=? AND e.app_id=? AND e.channel=? AND g.revoked_at IS NULL
  AND g.expires_at>? AND (e.channel!='qualification' OR g.is_owner=1)`;
@@ -32,6 +78,7 @@ export default {async fetch(request, env) {
   try {
     const approved=origin(env.UPDATE_ORIGIN), url=new URL(request.url);
     if(url.origin!==approved || url.search || url.username || url.password) return reply({error:'invalid_request'},400);
+    if(request.headers.has('Cloudflare-Workers-Version-Overrides'))return reply({error:'version_override_denied'},403);
     const requestedOrigin=request.headers.get('Origin');
     if((requestedOrigin && requestedOrigin!==approved) || request.headers.get('Sec-Fetch-Site')==='cross-site') return reply({error:'cross_origin_denied'},403);
     if(request.method==='GET' && url.pathname==='/') return new Response(PAGE,{headers:{...POLICY,'Content-Type':'text/html; charset=utf-8'}});
@@ -57,7 +104,10 @@ export default {async fetch(request, env) {
         WHERE c.app_id=? AND c.channel=? AND EXISTS(SELECT 1 ${auth})`,[m[1],m[2],hash,m[1],m[2],now]);
     }else{
       if(!ID.test(a[2]))return deny();
-      row=await primary(env,`SELECT r.* FROM releases r WHERE r.app_id=? AND r.release_id=?
+      row=await primary(env,`SELECT r.*,p.parts_json FROM releases r LEFT JOIN artifact_parts p
+        ON p.app_id=r.app_id AND p.release_id=r.release_id AND p.kind='${a[3]}'
+        AND p.artifact_sha256=json_extract(r.manifest_json,'$.${a[3]==='package'?'first_install':'archive'}.sha256')
+        WHERE r.app_id=? AND r.release_id=?
         AND EXISTS(SELECT 1 FROM grants g JOIN entitlements e ON e.grant_id=g.grant_id
           WHERE g.token_hash=? AND e.app_id=r.app_id AND e.channel=r.channel AND g.revoked_at IS NULL
           AND g.expires_at>? AND (r.channel!='qualification' OR g.is_owner=1))
@@ -70,12 +120,15 @@ export default {async fetch(request, env) {
        row.object_key!==`${APP}/${release.archive.sha256}.zip`)throw new Error('manifest');
     if(m)return reply(release);
     const artifact=a[3]==='package'?release.first_install:release.archive;
-    const objectKey=a[3]==='package'?`${APP}/${artifact.sha256}.package.zip`:row.object_key;
-    // Conditional/range requests still authorize; never return public 304s.
+    const ordered=parts(JSON.parse(row.parts_json),APP,row.release_id,a[3],artifact);
+    // Conditional/range requests authorize first; never return a cached 304.
     if(request.headers.has('Range'))return reply({error:'ranges_unsupported'},416,{'Accept-Ranges':'none'});
-    const object=await env.ARCHIVES[request.method==='HEAD'?'head':'get'](objectKey);
-    if(!object||object.size!==artifact.size)throw new Error('archive');
-    return new Response(request.method==='HEAD'?null:object.body,{headers:{...POLICY,
+    if([...request.headers.keys()].some(k=>k.startsWith('if-')))return reply({error:'conditions_unsupported'},400);
+    let body=null;
+    if(request.method==='HEAD') {
+      for(const part of ordered)await asset(env,approved,part,'HEAD',request.signal);
+    } else body=await multipart(env,approved,ordered,request.signal);
+    return new Response(body,{headers:{...POLICY,
       'Content-Type':'application/zip','Content-Length':String(artifact.size),
       'Content-Disposition':'attachment; filename="Machine-Monitor.zip"','Accept-Ranges':'none'}});
   } catch {return reply({error:'service_unavailable'},503,{'Retry-After':'30'});}

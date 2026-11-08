@@ -4,16 +4,17 @@ import {fixture} from './update_worker.mjs';
 import worker from '../../delivery/worker.mjs';
 const f=fixture();let mode='normal',received=0,aborted=0;
 const pending=new Set();
-const realGet=f.env.ARCHIVES.get.bind(f.env.ARCHIVES);
-f.env.ARCHIVES.get=async key=>{
-  const object=await realGet(key);if(!object)return object;
-  if(mode==='tamper')return {...object,body:new ReadableStream({start(c){c.enqueue(Buffer.alloc(object.size,1));c.close();}})};
-  if(mode==='short')return {...object,size:object.size-1};
+const realFetch=f.env.ASSETS.fetch.bind(f.env.ASSETS);
+f.env.ASSETS.fetch=async request=>{
+  const response=await realFetch(request);if(response.status!==200||request.method==='HEAD')return response;
+  const size=Number(response.headers.get('Content-Length'));
+  if(mode==='tamper')return new Response(Buffer.alloc(size,1),{headers:response.headers});
+  if(mode==='short')return new Response(Buffer.alloc(size-1,1),{headers:{'Content-Length':String(size-1)}});
   if(mode==='slow'){
-    const bytes=f.objects.get(key);let timer;
-    return {...object,body:new ReadableStream({start(c){c.enqueue(bytes.subarray(0,3));timer=setTimeout(()=>{pending.delete(timer);c.enqueue(bytes.subarray(3));c.close();},1500);pending.add(timer);},cancel(){clearTimeout(timer);pending.delete(timer);aborted++;}})};
+    const bytes=f.objects.get(new URL(request.url).pathname);let timer;
+    return new Response(new ReadableStream({start(c){c.enqueue(bytes.subarray(0,3));timer=setTimeout(()=>{pending.delete(timer);c.enqueue(bytes.subarray(3));c.close();},1500);pending.add(timer);},cancel(){clearTimeout(timer);pending.delete(timer);aborted++;}}),{headers:response.headers});
   }
-  return object;
+  return response;
 };
 const server=https.createServer({key:readFileSync(process.argv[2]),cert:readFileSync(process.argv[3])},async(req,res)=>{
   try{

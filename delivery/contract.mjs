@@ -42,3 +42,19 @@ export function validateDescriptor(a, app, release, kind) {
 export async function sha256(bytes) {
   return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), x => x.toString(16).padStart(2,'0')).join('');
 }
+
+// Immutable publication-only metadata. Full archive hashes/signatures stay on wire.
+export const PART_SIZE=20*1024*1024;
+export function parts(value,app,release,kind,descriptor) {
+  if(!Array.isArray(value)||value.length<1||value.length>26)throw new Error('parts');
+  let total=0;
+  value.forEach((part,index)=>{
+    if(!part || Object.keys(part).sort().join(',')!=='index,path,sha256,size' || part.index!==index ||
+      !Number.isSafeInteger(part.size)||part.size<1||part.size>PART_SIZE ||
+      (index<value.length-1&&part.size!==PART_SIZE) || !/^[a-f0-9]{64}$/.test(part.sha256) ||
+      part.path!==`/_private/${app}/${release}/${kind}/${descriptor.sha256}/${index}-${part.sha256}.part`)throw new Error('parts');
+    total+=part.size;
+  });
+  if(total!==descriptor.size)throw new Error('parts');
+  return value;
+}
