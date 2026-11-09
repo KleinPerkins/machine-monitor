@@ -27,8 +27,12 @@ def summarize(readings,at=None,error=None):
     """Reject sentinel/malformed values. Report only explicitly mapped sensors."""
     groups={}
     for group,keys in [('cpu',CPU_KEYS),('gpu',GPU_KEYS)]:
+        # M2 CPU sensors can return broken sub-10 C values: Stats readers.swift
+        # at the pinned revision above. Omit them instead of showing stale data.
+        minimum=10 if group=='cpu' else 0
         items=[dict(key=k,celsius=float(readings[k])) for k in keys
-               if isinstance(readings.get(k),(float,int)) and math.isfinite(readings[k]) and 0<readings[k]<=150]
+               if isinstance(readings.get(k),(float,int)) and math.isfinite(readings[k]) and
+               0<readings[k]<=150 and readings[k]>=minimum]
         values=[s['celsius'] for s in items]
         groups[group+'_c']=sum(values)/len(values) if values else None
         groups[group+'_max_c']=max(values) if values else None
