@@ -37,7 +37,7 @@ def browser_fixture():
                     errors = []
                     page.on('pageerror', lambda error: errors.append(str(error)))
                     page.goto(info['origin'])
-                    page.wait_for_function("typeof document.querySelector('#download').onclick === 'object'")
+                    page.wait_for_function("() => typeof document.querySelector('#download').onclick === 'object'")
                     yield page, context, info
                     assert errors == [], errors
                 finally:
@@ -109,7 +109,9 @@ def layout():
 def lifecycle():
     with browser_fixture() as (page, context, info):
         # Observe lifecycle only; no token is returned by a production endpoint.
-        page.evaluate("""() => {window.fixtureURLs={created:0,revoked:0};const c=URL.createObjectURL.bind(URL),r=URL.revokeObjectURL.bind(URL);URL.createObjectURL=b=>{window.fixtureURLs.created++;return c(b)};URL.revokeObjectURL=u=>{window.fixtureURLs.revoked++;r(u)}}""")
+        tracking = """() => {window.fixtureURLs={created:0,revoked:0};const c=URL.createObjectURL.bind(URL),r=URL.revokeObjectURL.bind(URL);URL.createObjectURL=b=>{window.fixtureURLs.created++;window.fixtureLastBlob=b;return c(b)};URL.revokeObjectURL=u=>{window.fixtureURLs.revoked++;window.fixtureLastBlob=null;r(u)}}"""
+        context.add_init_script('(' + tracking + ')()')
+        page.evaluate(tracking)
         requests = []
         page.on('request', lambda r: requests.append(r.url))
         choose(page, info['access'])
@@ -130,7 +132,9 @@ def lifecycle():
         choose(page, info['access'])
         page.locator('#download').click()
         expect(page.locator('#progress')).to_be_visible()
-        assert float(page.locator('#progress').get_attribute('value')) > 0
+        # The Worker verifies the whole bounded piece before emitting bytes.
+        page.wait_for_function("async()=> (await (await fetch('/fixture-state')).json()).pending > 0")
+        assert float(page.locator('#progress').get_attribute('value')) == 0
         page.locator('#reset').click()
         expect(page.locator('#status')).to_contain_text('Choose your access file')
         page.wait_for_timeout(1700)
@@ -158,6 +162,39 @@ def lifecycle():
         page.reload()
         expect(page.locator('#download')).to_be_disabled()
         assert page.evaluate('localStorage.length + sessionStorage.length') == 0
+        # Two-piece assembly works; revocation after piece zero denies piece one.
+        for scenario, message in (('multi', 'Download verified'), ('revoke-next', 'Access expired or revoked')):
+            mode(context, info, scenario)
+            choose(page, info['access'])
+            page.locator('#download').click()
+            expect(page.locator('#status')).to_contain_text(message)
+            if scenario == 'multi':
+                assert any('/parts/1' in url for url in requests)
+                assert page.evaluate("window.fixtureLastBlob.size") == 1024*1024+47
+                page.locator('#reset').click()
+            else:
+                expect(page.locator('#save')).to_be_hidden()
+        # A late asynchronous hash cannot continue after reset or total expiry.
+        mode(context, info, 'multi')
+        page.evaluate("""() => {const digest=crypto.subtle.digest.bind(crypto.subtle);crypto.subtle.digest=async(...args)=>{const result=await digest(...args);if(window.fixtureHoldHash)await new Promise(resolve=>{window.fixtureReleaseHash=resolve});return result}}""")
+        for action in ('reset', 'deadline'):
+            choose(page, info['access'])
+            page.evaluate('window.fixtureHoldHash=true;window.fixtureReleaseHash=null')
+            start = len(requests)
+            page.locator('#download').click()
+            page.wait_for_function("() => typeof window.fixtureReleaseHash === 'function'")
+            if action == 'reset':
+                page.locator('#reset').click()
+            else:
+                page.evaluate("window.fixtureOriginalNow=Date.now;Date.now=()=>window.fixtureOriginalNow()+301000")
+            page.evaluate('window.fixtureHoldHash=false;window.fixtureReleaseHash()')
+            if action == 'reset':
+                expect(page.locator('#status')).to_contain_text('Choose your access file')
+            else:
+                expect(page.locator('#status')).to_contain_text('interrupted or unavailable')
+                page.evaluate('Date.now=window.fixtureOriginalNow')
+            expect(page.locator('#save')).to_be_hidden()
+            assert not any('/parts/1' in url for url in requests[start:])
 
 if __name__ == '__main__':
     {'layout': layout, 'lifecycle': lifecycle}[sys.argv[1]]()

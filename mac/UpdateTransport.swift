@@ -1,9 +1,11 @@
 import Foundation
 import Darwin
+import CryptoKit
 
 // No global URLProtocol hook, trust override, shared cookie store or credential forwarding.
 final class UpdateTransport: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let origin: URL
+    private let now: () -> Date
     private var session: URLSession!
     private var task: URLSessionDataTask?
     private var completion: ((Result<Data, Error>) -> Void)?
@@ -13,8 +15,10 @@ final class UpdateTransport: NSObject, URLSessionDataDelegate, @unchecked Sendab
     private var expectedSize: Int?
     private var output: FileHandle?
     private var outputURL: URL?
-    init(origin: URL, fixtureProtocols: [AnyClass] = []) {
-        self.origin = origin; super.init()
+    private var assemblyID: UUID?
+    private var assemblyCancel: (() -> Void)?
+    init(origin: URL, fixtureProtocols: [AnyClass] = [], now: @escaping () -> Date = Date.init) {
+        self.origin = origin; self.now = now; super.init()
         let config = URLSessionConfiguration.ephemeral
         if !fixtureProtocols.isEmpty { config.protocolClasses = fixtureProtocols }
         config.httpShouldSetCookies = false; config.httpCookieStorage = nil
@@ -25,8 +29,77 @@ final class UpdateTransport: NSObject, URLSessionDataDelegate, @unchecked Sendab
         let queue = OperationQueue(); queue.maxConcurrentOperationCount = 1; queue.underlyingQueue = .main
         session = URLSession(configuration: config, delegate: self, delegateQueue: queue)
     }
-    func cancel() { task?.cancel(); finish(.failure(UpdateFailure.cancelled)) }
+    func cancel() {
+        let cancelAssembly = assemblyCancel; assemblyCancel = nil; assemblyID = nil
+        task?.cancel(); finish(.failure(UpdateFailure.cancelled)); cancelAssembly?()
+    }
     func close() { cancel(); session.invalidateAndCancel() }
+    func download(archive: UpdateManifest.Archive, token: String, output: URL,
+                  completion: @escaping (Result<Data, Error>) -> Void) {
+        precondition(Thread.isMainThread)
+        guard task == nil, assemblyID == nil else { completion(.failure(UpdateFailure.busy)); return }
+        let fd = open(output.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { completion(.failure(UpdateFailure.invalid("private download storage"))); return }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        var identity = stat(); guard fstat(fd, &identity) == 0 else { try? handle.close(); completion(.failure(UpdateFailure.invalid("download identity"))); return }
+        let id = UUID(), deadline = now().addingTimeInterval(300)
+        assemblyID = id; var finished = false; var timer: DispatchWorkItem?
+        func current() throws {
+            guard !finished, assemblyID == id, now() < deadline else { throw UpdateFailure.cancelled }
+        }
+        func done(_ outcome: Result<Data, Error>) {
+            guard !finished else { return }; finished = true; timer?.cancel(); timer = nil
+            if assemblyID == id { assemblyID = nil; assemblyCancel = nil }
+            var result = outcome
+            do { try handle.close() } catch { result = .failure(UpdateFailure.invalid("download close failed")) }
+            if case .failure = result {
+                var live = stat()
+                if lstat(output.path, &live) == 0, live.st_dev == identity.st_dev, live.st_ino == identity.st_ino {
+                    _ = unlink(output.path)
+                }
+            }
+            completion(result)
+        }
+        assemblyCancel = { done(.failure(UpdateFailure.cancelled)) }
+        timer = DispatchWorkItem { [weak self] in
+            guard !finished else { return }
+            self?.cancel()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 300, execute: timer!)
+        func endpoint(_ suffix: String) throws -> URL {
+            guard archive.path.range(of: "^/v1/apps/com\\.kleinperkins\\.machine-monitor/releases/[A-Za-z0-9_-]{1,128}/(archive|package)$", options: .regularExpression) != nil,
+                  let url = URL(string: origin.absoluteString + archive.path + suffix)
+            else { throw UpdateFailure.invalid("piece address") }
+            return url
+        }
+        func next(_ descriptor: UpdatePieceDescriptor, _ index: Int) {
+            guard !finished else { return }
+            do {
+                try current()
+                if index == descriptor.parts.count {
+                    try handle.synchronize(); try current(); done(.success(Data())); return
+                }
+                let part = descriptor.parts[index]
+                request(url: try endpoint("/parts/\(index)"), token: token, limit: part.size, expectedSize: part.size) { result in
+                    guard !finished else { return }
+                    do {
+                        try current(); let data = try result.get()
+                        guard data.count == part.size, SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == part.sha256
+                        else { throw UpdateFailure.invalid("piece hash/length") }
+                        try current(); try handle.write(contentsOf: data); try current()
+                        next(descriptor, index + 1)
+                    } catch { done(.failure(error)) }
+                }
+            } catch { done(.failure(error)) }
+        }
+        do {
+            request(url: try endpoint("/parts"), token: token, limit: 131_072) { result in
+                guard !finished else { return }
+                do { try current(); let value = try UpdatePieceDescriptor.parse(result.get(), archive: archive); try current(); next(value, 0) }
+                catch { done(.failure(error)) }
+            }
+        } catch { done(.failure(error)) }
+    }
     func request(url: URL, token: String, body: Data? = nil, limit: Int,
                  output: URL? = nil, expectedSize: Int? = nil,
                  completion: @escaping (Result<Data, Error>) -> Void) {

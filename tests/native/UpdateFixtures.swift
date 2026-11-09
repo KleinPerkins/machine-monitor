@@ -24,13 +24,17 @@ private final class FixtureProtocol: URLProtocol {
     static var bytes = Data("fixture".utf8)
     static var contentLength: Int? = nil
     static var seen: URLRequest?
+    static var handler: ((URLRequest) -> (Int, Data, Int?))?
+    static var afterDelivery: (() -> Void)?
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         Self.seen = request
-        let response = HTTPURLResponse(url: request.url!, statusCode: Self.status, httpVersion: "HTTP/1.1", headerFields: ["Content-Length": String(Self.contentLength ?? Self.bytes.count)])!
+        let (status, bytes, length) = Self.handler?(request) ?? (Self.status, Self.bytes, Self.contentLength)
+        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Length": String(length ?? bytes.count)])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Self.bytes)
+        client?.urlProtocol(self, didLoad: bytes)
+        Self.afterDelivery?()
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
@@ -182,6 +186,7 @@ private final class FixtureProtocol: URLProtocol {
         try check(permissions == 0o600, "private streamed file")
         let truncated: Result<Data, Error> = try awaitValue { done in transport.request(url: origin.appendingPathComponent("v1/archive"), token: token, limit: 100, expectedSize: 10, completion: done) }
         try refuses("wrong announced length") { _ = try truncated.get() }
+        try pieceFixtures(base: base, transport: transport, token: token, manifest: manifest)
         transport.close()
         let generations = UpdateGeneration(); let stale = generations.value; generations.invalidate()
         try check(!generations.accepts(stale), "remove/replacement invalidates late completions")
@@ -190,6 +195,58 @@ private final class FixtureProtocol: URLProtocol {
         let disabled = UpdateCoordinator.bootstrap(bundle: .main)
         try check(disabled.phase == .disabled && disabled.allowsCollectorService && !disabled.suppressAutomaticScan, "fixture build update-disabled")
         print("NATIVE_UPDATE_FIXTURES " + String(assertions))
+    }
+    private static func pieceFixtures(base: URL, transport: UpdateTransport, token: String, manifest: UpdateManifest) throws {
+        let size = UpdatePieceDescriptor.pieceSize
+        let payload = Data((0..<(size + 13)).map { UInt8($0 % 251) })
+        func hash(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+        let archive = UpdateManifest.Archive(path: manifest.archive.path, size: payload.count, sha256: hash(payload), ed25519_signature: manifest.archive.ed25519_signature)
+        let pieces = [payload.subdata(in: 0..<size), payload.subdata(in: size..<payload.count)]
+        let rows: [[String: Any]] = pieces.enumerated().map { ["index": $0.offset, "size": $0.element.count, "sha256": hash($0.element)] }
+        let descriptor: [String: Any] = ["schema": "machine-monitor/artifact-parts/v1", "app_id": UpdateConfiguration.appID,
+            "release_id": "fixture", "kind": "archive", "artifact_sha256": archive.sha256, "artifact_size": archive.size, "part_size": size, "parts": rows]
+        let json = try JSONSerialization.data(withJSONObject: descriptor)
+        try check(try UpdatePieceDescriptor.parse(json, archive: archive).parts.count == 2, "bound piece descriptor")
+        for change in [["part_size": true], ["part_size": size * 20], ["artifact_size": true], ["release_id": "other"], ["kind": "package"], ["parts": Array(rows.reversed())], ["parts": [rows[0], rows[0]]], ["parts": []], ["extra": 1]] as [[String: Any]] {
+            try refuses("invalid piece descriptor") { _ = try UpdatePieceDescriptor.parse(JSONSerialization.data(withJSONObject: descriptor.merging(change) { _, new in new }), archive: archive) }
+        }
+        let duplicate = String(decoding: json, as: UTF8.self).replacingOccurrences(of: "\"part_size\":", with: "\"part_size\":1,\"part_size\":")
+        try refuses("duplicate piece descriptor key") { _ = try UpdatePieceDescriptor.parse(Data(duplicate.utf8), archive: archive) }
+        var mode = "normal", requests = [String]()
+        FixtureProtocol.handler = { request in
+            let path = request.url!.path; requests.append(path)
+            if path.hasSuffix("/parts") { return (200, json, nil) }
+            let index = Int(path.split(separator: "/").last!)!
+            if mode == "revoke" && index == 1 { return (401, Data(), nil) }
+            if mode == "tamper" && index == 1 { return (200, Data(repeating: 0, count: 13), 13) }
+            if mode == "short" && index == 1 { return (200, Data(repeating: 0, count: 12), 13) }
+            return (200, pieces[index], nil)
+        }
+        defer { FixtureProtocol.handler = nil; FixtureProtocol.afterDelivery = nil }
+        let target = base.appendingPathComponent("assembled.zip")
+        let result: Result<Data, Error> = try awaitValue { transport.download(archive: archive, token: token, output: target, completion: $0) }
+        _ = try result.get(); try check(try Data(contentsOf: target) == payload, "ordered authenticated assembly")
+        try check(requests.count == 3, "one descriptor and two piece requests")
+        for bad in ["revoke", "tamper", "short", "cancel"] {
+            mode = bad; requests = []; let output = base.appendingPathComponent("piece-" + bad)
+            if bad == "cancel" { FixtureProtocol.afterDelivery = { DispatchQueue.main.async { transport.cancel() } } }
+            let denied: Result<Data, Error> = try awaitValue { transport.download(archive: archive, token: token, output: output, completion: $0) }
+            try refuses("partial piece operation succeeded") { _ = try denied.get() }
+            try check(!FileManager.default.fileExists(atPath: output.path), "owned partial removed")
+            FixtureProtocol.afterDelivery = nil
+        }
+        mode = "normal"; requests = []
+        var instant = Date()
+        let timed = UpdateTransport(origin: URL(string: "https://updates.invalid")!, fixtureProtocols: [FixtureProtocol.self], now: { instant })
+        FixtureProtocol.afterDelivery = { instant = instant.addingTimeInterval(301) }
+        let expiredOutput = base.appendingPathComponent("piece-deadline")
+        let expired: Result<Data, Error> = try awaitValue { timed.download(archive: archive, token: token, output: expiredOutput, completion: $0) }
+        try refuses("overall deadline resets between requests") { _ = try expired.get() }
+        try check(requests.count == 1 && !FileManager.default.fileExists(atPath: expiredOutput.path), "deadline stops before first piece and removes partial")
+        FixtureProtocol.afterDelivery = nil; timed.close(); requests = []
+        let exists: Result<Data, Error> = try awaitValue { transport.download(archive: archive, token: token, output: target, completion: $0) }
+        try refuses("preexisting output overwritten") { _ = try exists.get() }
+        try check(try Data(contentsOf: target) == payload && requests.isEmpty, "preexisting output preserved")
     }
     private static func stateFixtures(base: URL, manifest: UpdateManifest) throws {
         try lockTransportFixtures(base: base.appendingPathComponent("helper-lock"))

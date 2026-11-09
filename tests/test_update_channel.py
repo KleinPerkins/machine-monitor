@@ -291,16 +291,28 @@ class ChannelTests(unittest.TestCase):
 
     def test_private_readback_identifies_application_and_revokes_temporary_grant(self):
         api=delivery.Cloudflare.__new__(delivery.Cloudflare);api.config=self.api.config;api._opener=MagicMock()
+        digest=hashlib.sha256(b'test').hexdigest()
+        table=dict(schema='machine-monitor/artifact-parts/v1',app_id=delivery.APP,release_id='fixture',kind='archive',
+                   artifact_sha256=digest,artifact_size=4,part_size=delivery.PIECE_SIZE,parts=[dict(index=0,size=4,sha256=digest)])
+        metadata=MagicMock();metadata.status=200;metadata.read.return_value=json.dumps(table).encode()
         response=MagicMock();response.status=200;response.headers={'Content-Length':'4'};response.read.side_effect=[b'test',b'']
-        api._opener.open.return_value.__enter__.return_value=response
+        first,second=MagicMock(),MagicMock();first.__enter__.return_value=metadata;second.__enter__.return_value=response
+        api._opener.open.side_effect=[first,second]
         with patch.object(api,'query',return_value=[]) as queries:
             api.readback('fixture',{'size':4,'sha256':hashlib.sha256(b'test').hexdigest()},'archive')
         request=api._opener.open.call_args.args[0]
         self.assertEqual(request.get_header('User-agent'),'MachineMonitor-Delivery/1.0')
-        self.assertEqual(request.full_url,self.api.config['origin']+'/v1/apps/'+delivery.APP+'/releases/fixture/archive')
+        self.assertEqual(request.full_url,self.api.config['origin']+'/v1/apps/'+delivery.APP+'/releases/fixture/archive/parts/0')
         self.assertTrue(request.get_header('Authorization').startswith('Bearer '))
         self.assertNotIn(request.get_header('Authorization')[7:],repr(queries.call_args_list))
         self.assertIn('revoked_at',queries.call_args.args[0])
+        self.assertEqual(len(delivery.validate_piece_descriptor(json.dumps(table).encode(),'fixture','archive',{'size':4,'sha256':digest})),1)
+        for change in ({'part_size':True},{'artifact_size':True},{'parts':[]},{'extra':1},{'kind':'package'},
+                       {'parts':[dict(index=False,size=4,sha256=digest)]},{'parts':[dict(index=0,size=5,sha256=digest)]}):
+            with self.assertRaises(delivery.DeliveryError):
+                delivery.validate_piece_descriptor(json.dumps(dict(table,**change)).encode(),'fixture','archive',{'size':4,'sha256':digest})
+        with self.assertRaises(delivery.DeliveryError):
+            delivery.validate_piece_descriptor(json.dumps(table).replace('"part_size":','"part_size":1,"part_size":').encode(),'fixture','archive',{'size':4,'sha256':digest})
 
     def test_deployment_requires_unconditional_private_worker_first_and_owned_origin(self):
         config = self.api.config
@@ -385,8 +397,8 @@ class ChannelTests(unittest.TestCase):
         source.write_bytes(data)
         desc = {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
         parts = delivery.stage_artifact(self.api.config, source, 'fixture-1', 'archive', desc)
-        self.assertEqual([p['size'] for p in parts], [delivery.PART_SIZE, 17])
-        self.assertEqual(len(delivery.asset_inventory(self.api.config)),2)
+        self.assertEqual([p['size'] for p in parts], [delivery.PIECE_SIZE]*20+[17])
+        self.assertEqual(len(delivery.asset_inventory(self.api.config)),21)
         api = delivery.Cloudflare.__new__(delivery.Cloudflare);api.config = self.api.config
         rows = [{'parts_json':json.dumps(parts)}]
         with patch.object(api,'query',return_value=rows):

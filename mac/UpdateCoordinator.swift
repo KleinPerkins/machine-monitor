@@ -223,8 +223,7 @@ final class UpdateCoordinator: NSObject {
             let directory = try operation.beginStaging(manifest: manifest); staging = directory
             let archive = directory.appendingPathComponent("archive.zip")
             self.manifest = manifest; set(.downloading, "Downloading verified release…")
-            transport?.request(url: try config.endpoint(manifest.archive.path), token: access.token, limit: manifest.archive.size,
-                               output: archive, expectedSize: manifest.archive.size) { [weak self] result in
+            transport?.download(archive: manifest.archive, token: access.token, output: archive) { [weak self] result in
                 guard let self, self.generation.accepts(ticket) else { return }
                 do {
                     _ = try result.get(); self.set(.preflighting, "Verifying application…")
