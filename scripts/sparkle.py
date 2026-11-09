@@ -3,7 +3,9 @@ import fcntl
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import stat
 import tarfile
 import tempfile
 from scripts.toolchain import download_bytes
@@ -34,7 +36,25 @@ def _manifest(directory):
     return result
 
 
-def distribution(cache=None):
+def pinned_archive(path):
+    """Read an explicitly supplied official archive; never trust cache metadata alone."""
+    path = Path(path)
+    if not path.is_absolute() or path != path.resolve():
+        raise ValueError('Sparkle archive must use an absolute canonical regular-file path')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or not 0 < info.st_size <= 40 * 1024**2:
+            raise ValueError('Sparkle archive must be an owned bounded regular file')
+        payload = stream.read(40 * 1024**2 + 1)
+    if len(payload) > 40 * 1024**2 or hashlib.sha256(payload).hexdigest() != SHA256:
+        raise ValueError('Sparkle archive checksum mismatch')
+    return payload
+
+
+def distribution(cache=None, *, archive=None):
+    # Validate explicit input even if a verified extraction already exists.
+    supplied = pinned_archive(archive) if archive is not None else None
     cache = Path(cache or ROOT / 'build/toolchains')
     cache.mkdir(parents=True, exist_ok=True)
     if cache.is_symlink():
@@ -47,7 +67,7 @@ def distribution(cache=None):
             if target.is_symlink() or receipt != {'archive_sha256': SHA256, 'files': _manifest(target)}:
                 raise ValueError('Cached Sparkle distribution changed')
             return target
-        payload = download_bytes(URL, 40 * 1024**2, 40)
+        payload = supplied if supplied is not None else download_bytes(URL, 40 * 1024**2, 40)
         if len(payload) > 40 * 1024**2 or hashlib.sha256(payload).hexdigest() != SHA256:
             raise ValueError('Sparkle archive checksum mismatch')
         with tempfile.TemporaryDirectory(prefix='sparkle-stage-', dir=cache) as temporary:
