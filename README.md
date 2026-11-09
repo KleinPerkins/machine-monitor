@@ -78,7 +78,9 @@ The six verification selections are `governance`, `core`, `service`, `browser-la
 
 ## Reviewer App setup
 
-Reviewer automation is staged separately from CI. It executes only the trusted workflow revision, reads immutable base/head changed-file comparisons, rejects protected governance/verification/packaging changes, and checks current GitHub Actions CI plus live merge controls before approval and before requesting native squash auto-merge. Changes at the comparison API's 300-file boundary or above use the owner path. Dependabot changes use the owner path as well.
+Reviewer automation executes only the trusted workflow revision and approves ready PRs authored by `KleinPerkins` (GitHub user ID `49759187`, type `User`) regardless of changed paths, change count or branch naming. This includes governance, workflows, verification, packaging, delivery and the approval policy itself. PRs must be open, target `main` from this repository, and have successful current-commit GitHub Actions `ci-required`. Live merge controls and immutable base/head identity are rechecked before approval and before the App requests native squash auto-merge.
+
+For other authors, the existing member/collaborator policy still uses immutable base/head changed-file comparisons, excludes protected paths and automated branch names, and refuses changes at the comparison API's 300-file boundary or above. Dependabot remains outside that policy. App approval is policy approval; technical review and required CI remain separate.
 
 An owner must grant the reviewer App access to this repository and provision `AUTOMERGE_APP_ID` and `AUTOMERGE_APP_PRIVATE_KEY` through encrypted GitHub Actions secrets. Use the App owner's secure credential source; do not retrieve another repository's secret values or paste credentials into a chat, source file or log. The workflow mints a token scoped only to `KleinPerkins/machine-monitor`.
 

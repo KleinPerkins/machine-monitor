@@ -12,7 +12,7 @@ REPO = 'KleinPerkins/machine-monitor'
 
 def pull():
     return dict(number=7, state='open', draft=False, changed_files=1, author_association='OWNER',
-                user=dict(login='fixture-owner', id=100, type='User'),
+                user=dict(login='KleinPerkins', id=49759187, type='User'),
                 head=dict(sha=HEAD, ref='feat/fixture', repo=dict(full_name=REPO)),
                 base=dict(ref='main', sha='c'*40, repo=dict(full_name=REPO)), auto_merge=None)
 
@@ -26,7 +26,7 @@ class OrdinaryHeadPolicy(unittest.TestCase):
     def test_current_ordinary_owner_head_is_eligible(self):
         self.assertTrue(policy.eligible(pull(), run(), ['app.js'], base_sha='c'*40))
 
-    def test_all_governance_packaging_and_verification_paths_are_protected(self):
+    def test_owner_changes_are_eligible_for_every_path(self):
         names = ['.github/workflows/ci.yml', '.github/test-shards.json', '.github/CODEOWNERS',
                  '.planning/doc-warden.json', '_ops/POLICY.md', 'AGENTS.md', 'README.md', 'SECURITY.md',
                  'Makefile', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'requirements.txt',
@@ -35,12 +35,16 @@ class OrdinaryHeadPolicy(unittest.TestCase):
                  'delivery/wrangler.template.json','delivery/worker.mjs','delivery/schema.sql',
                  'update_contract.py','update_preflight.py','update_recovery.py','PRIVATE-BINARY-LICENSE']
         for name in names:
-            self.assertFalse(policy.eligible(pull(), run(), [name], base_sha='c'*40), name)
-            self.assertFalse(policy.eligible(pull(), run(), [name.upper()], base_sha='c'*40), name)
+            self.assertTrue(policy.eligible(pull(), run(), [name], base_sha='c'*40), name)
+            self.assertTrue(policy.eligible(pull(), run(), [name.upper()], base_sha='c'*40), name)
+            other = pull();other['user'] = dict(login='fixture-member', id=100, type='User')
+            self.assertFalse(policy.eligible(other, run(), [name], base_sha='c'*40), name)
 
-    def test_rename_of_a_protected_file_is_still_protected(self):
+    def test_rename_paths_do_not_restrict_owner_but_still_restrict_other_authors(self):
         files = policy.complete_changed_files(pull(), [dict(filename='app.js', previous_filename='scripts/verify.py')])
-        self.assertFalse(policy.eligible(pull(), run(), files, base_sha='c'*40))
+        self.assertTrue(policy.eligible(pull(), run(), files, base_sha='c'*40))
+        other = pull();other['user'] = dict(login='fixture-member', id=100, type='User')
+        self.assertFalse(policy.eligible(other, run(), files, base_sha='c'*40))
 
     def test_missing_duplicate_or_unsafe_file_evidence_refuses(self):
         for entries in ([], [dict(filename='../app.js')], [dict(filename='/app.js')],
@@ -52,7 +56,7 @@ class OrdinaryHeadPolicy(unittest.TestCase):
             policy.complete_changed_files(pr, [dict(filename='app.js'), dict(filename='app.js')])
 
     def test_stale_foreign_draft_and_bot_heads_are_ineligible(self):
-        changes = [dict(draft=True), dict(state='closed'), dict(author_association='NONE'),
+        changes = [dict(draft=True), dict(state='closed'),
                    dict(head=dict(sha='b'*40, ref='feat/fixture', repo=dict(full_name=REPO))),
                    dict(head=dict(sha=HEAD, ref='feat/fixture', repo=dict(full_name='foreign/repo'))),
                    dict(user=dict(login='dependabot[bot]', id=shared.DEPENDABOT_ID, type='Bot'))]
@@ -62,6 +66,25 @@ class OrdinaryHeadPolicy(unittest.TestCase):
         for change in (dict(conclusion='cancelled'), dict(event='push'), dict(path='.github/workflows/other.yml')):
             event = run();event.update(change)
             self.assertFalse(policy.eligible(pull(), event, ['app.js'], base_sha='c'*40))
+
+    def test_owner_identity_requires_login_numeric_id_and_user_type(self):
+        for change in (dict(login='somebody-else'), dict(id=100), dict(id='49759187'),
+                       dict(type='Bot'), dict(id=None)):
+            pr = pull();pr['user'].update(change)
+            self.assertFalse(policy.eligible(pr, run(), ['scripts/auto_merge.py'], base_sha='c'*40))
+        pr = pull();pr.pop('user')
+        self.assertFalse(policy.eligible(pr, run(), ['scripts/auto_merge.py'], base_sha='c'*40))
+
+    def test_owner_branch_names_and_association_do_not_restrict_approval(self):
+        for branch in ('dependabot/owner-authored', 'release-please--owner-authored'):
+            pr = pull();pr['head']['ref'] = branch;pr['author_association'] = 'NONE'
+            self.assertTrue(policy.eligible(pr, run(), ['scripts/auto_merge.py'], base_sha='c'*40))
+
+    def test_non_owner_ordinary_changes_keep_existing_policy(self):
+        pr = pull();pr['user'] = dict(login='fixture-member', id=100, type='User')
+        self.assertTrue(policy.eligible(pr, run(), ['app.js'], base_sha='c'*40))
+        pr['author_association'] = 'NONE'
+        self.assertFalse(policy.eligible(pr, run(), ['app.js'], base_sha='c'*40))
 
     def test_immutable_public_identity_is_required(self):
         event = dict(repository=dict(full_name=REPO, id=12345), workflow_run=run())
@@ -213,7 +236,7 @@ class EffectiveMergeControls(unittest.TestCase):
 
 class ImmutableFileEvidence(unittest.TestCase):
     def test_A_B_A_switch_cannot_substitute_ordinary_paths_for_protected_A(self):
-        pr = pull()
+        pr = pull();pr['user'] = dict(login='fixture-member', id=100, type='User')
         observed_paths = []
         mutable_head = [HEAD]
         def request(path):
@@ -236,11 +259,23 @@ class ImmutableFileEvidence(unittest.TestCase):
         for observed in ({}, dict(base_commit=dict(sha='d'*40), files=[dict(filename='app.js')]),
                          dict(base_commit=dict(sha='c'*40), files=[])):
             with self.assertRaises(shared.AutomationError):
-                policy.immutable_changed_files(pull(), lambda _: observed)
+                other = pull();other['user'] = dict(login='fixture-member', id=100, type='User')
+                policy.immutable_changed_files(other, lambda _: observed)
         for count in (300, 301):
             pr = pull();pr['changed_files'] = count
+            pr['user'] = dict(login='fixture-member', id=100, type='User')
             with self.assertRaises(shared.AutomationError):
                 policy.immutable_changed_files(pr, lambda _: self.fail('Boundary/over-limit comparison must not execute'))
+
+    def test_owner_changes_do_not_depend_on_comparison_file_limits(self):
+        for count in (1, 300, 301, 3001):
+            pr = pull();pr['changed_files'] = count
+            base, files = policy.immutable_changed_files(pr, lambda _: self.fail('Owner paths need no comparison'))
+            self.assertTrue(policy.eligible(pr, run(), files, base_sha=base))
+        for field in ('head', 'base'):
+            pr = pull();pr[field]['sha'] = 'invalid'
+            with self.assertRaises(shared.AutomationError):
+                policy.immutable_changed_files(pr, lambda _: self.fail('Malformed revisions must refuse'))
 
     def test_base_change_invalidates_old_file_evidence(self):
         pr = pull();pr['base']['sha'] = 'd'*40

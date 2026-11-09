@@ -13,6 +13,16 @@ from github_automation import (REPO, SHA, AutomationError, Reporter, api, pages,
 
 from merge_controls import verify_controls
 
+OWNER_LOGIN = 'KleinPerkins'
+OWNER_ID = 49759187
+
+
+def owner_author(pr):
+    user = pr.get('user') or {}
+    return (user.get('login') == OWNER_LOGIN and type(user.get('id')) is int
+            and user['id'] == OWNER_ID and user.get('type') == 'User')
+
+
 PROTECTED = (
     '.github/*', '.githooks/*', '.gitleaks*', '.gitignore', '.planning/*',
     '.codex/*', '.cursor/*', '.claude/*', '.agents/*', '_ops/*', 'docs/*',
@@ -51,6 +61,10 @@ def immutable_changed_files(pr, request):
     base, head = pr.get('base', {}).get('sha'), pr.get('head', {}).get('sha')
     if not isinstance(base, str) or not SHA.fullmatch(base) or not isinstance(head, str) or not SHA.fullmatch(head):
         raise AutomationError('Immutable base/head revisions required')
+    # Owner approval is independent of paths and change count. Keep the
+    # immutable revisions without relying on the comparison API's file cap.
+    if owner_author(pr):
+        return base, []
     # GitHub compare caps files at 300. At that boundary completeness is
     # ambiguous, so those changes and larger ones use the owner path.
     count = pr.get('changed_files')
@@ -74,6 +88,8 @@ def eligible(pr, run, files, *, base_sha):
         return False
     if pr['head']['sha'] != run.get('head_sha') or pr.get('base', {}).get('sha') != base_sha:
         return False
+    if owner_author(pr):
+        return True
     if pr['head'].get('ref', '').startswith(('release-please--', 'dependabot/')) or dependabot_author(pr):
         return False
     if pr.get('author_association') not in ('OWNER', 'MEMBER', 'COLLABORATOR'):
@@ -120,7 +136,7 @@ def main():
         pr = api(path)
         base_sha, files = immutable_changed_files(pr, api)
         if not eligible(pr, run, files, base_sha=base_sha):
-            report(f'PR #{number}: protected change or ineligible current head; owner path required.')
+            report(f'PR #{number}: current head is outside the automatic approval policy; deferred.')
             continue
         if reviewer is None:
             reviewer = reviewer_identity(api, os.environ.get('REVIEWER_LOGIN', ''))
