@@ -28,7 +28,9 @@ APP = 'com.kleinperkins.machine-monitor'
 WRANGLER = '4.158.0'
 MAX_ARCHIVE = 512 * 1024 * 1024
 PART_SIZE = 20 * 1024 * 1024
-PIECE_SIZE = 1024 * 1024
+PIECE_SIZE = 256 * 1024
+MAX_PIECES = 2048
+WIRE_LIMIT = 256 * 1024
 MAX_FILES = 20000
 FREE_PROOF_MAX_AGE = 3600
 CHECKS = ('ci_required', 'merged_source', 'developer_id', 'notarization',
@@ -159,9 +161,9 @@ def asset_inventory(config):
                 raise DeliveryError('Private asset directories must have mode 0700.')
             continue
         relative = '/' + path.relative_to(root).as_posix()
-        pattern = r'/_private/' + re.escape(APP) + r'/[A-Za-z0-9_-]{1,128}/(?:archive|package)/[a-f0-9]{64}/(?:0|[1-9][0-9]{0,2})-([a-f0-9]{64})\.part'
+        pattern = r'/_private/' + re.escape(APP) + r'/[A-Za-z0-9_-]{1,128}/(?:archive|package)/[a-f0-9]{64}/(?:0|[1-9][0-9]{0,3})-([a-f0-9]{64})\.part'
         match = re.fullmatch(pattern, relative)
-        if (not match or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or
+        if (not match or int(path.name.split('-', 1)[0]) >= MAX_PIECES or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or
             not 0 < info.st_size <= PART_SIZE):
             raise DeliveryError('Only bounded private immutable part files may be deployed; no routing/control files.')
         digest, size = file_digest(path)
@@ -456,8 +458,8 @@ class Cloudflare:
             try:
                 request = urllib.request.Request(self.config['origin'] + path + '/parts', headers=headers)
                 with self._opener.open(request, timeout=30) as response:
-                    raw = response.read(131073)
-                    if response.status != 200 or len(raw) > 131072:
+                    raw = response.read(WIRE_LIMIT + 1)
+                    if response.status != 200 or len(raw) > WIRE_LIMIT:
                         raise DeliveryError('Private remote readback failed.')
                 ordered = validate_piece_descriptor(raw, release_id, kind, descriptor)
                 for part in ordered:
@@ -501,14 +503,14 @@ def validate_piece_descriptor(raw, release_id, kind, descriptor):
             result[key] = value
         return result
     try:
-        if len(raw) > 131072:
+        if len(raw) > WIRE_LIMIT:
             raise ValueError('size')
         value = json.loads(raw, object_pairs_hook=unique)
-        expected = dict(schema='machine-monitor/artifact-parts/v1', app_id=APP,
+        expected = dict(schema='machine-monitor/artifact-parts/v2', app_id=APP,
                         release_id=release_id, kind=kind, artifact_sha256=descriptor['sha256'],
                         artifact_size=descriptor['size'], part_size=PIECE_SIZE)
         if (set(value) != set(expected) | {'parts'} or any(type(value[k]) is not type(v) or value[k] != v for k, v in expected.items()) or
-                not isinstance(value['parts'], list) or not 1 <= len(value['parts']) <= 512 or
+                not isinstance(value['parts'], list) or not 1 <= len(value['parts']) <= MAX_PIECES or
                 len(value['parts']) != (descriptor['size'] + PIECE_SIZE - 1) // PIECE_SIZE):
             raise ValueError('fields')
         total = 0
@@ -664,10 +666,19 @@ def publish(api, value, receipt, archive=None, package=None):
         if not archive or not package:
             raise DeliveryError('Qualification publication requires both update and first-install archives.')
         for descriptor, source, kind in ((value['archive'], archive, 'archive'), (value['first_install'], package, 'package')):
+            existing = api.query('SELECT p.app_id,t.descriptor_schema,t.part_size FROM artifact_parts p LEFT JOIN artifact_protocols t USING(app_id,release_id,kind,artifact_sha256) WHERE p.app_id=? AND p.release_id=? AND p.kind=? AND p.artifact_sha256=?', (APP, release_id, kind, descriptor['sha256']))
+            if existing and (len(existing) != 1 or existing[0]['descriptor_schema'] != 'machine-monitor/artifact-parts/v2' or existing[0]['part_size'] != PIECE_SIZE):
+                raise DeliveryError('Legacy artifact identities are retention-only; use a new release identity.')
             prepared.append((kind, descriptor, stage_artifact(api.config, source, release_id, kind, descriptor)))
         api.deploy()  # complete retained set BEFORE any release/channel publication
         for kind, descriptor, parts in prepared:
             serialized_parts = json.dumps(parts, sort_keys=True, separators=(',', ':'))
+            # Never leave new parts without their protocol marker on interruption.
+            # Preflight has already refused every preexisting unmarked legacy row.
+            api.query('INSERT OR IGNORE INTO artifact_protocols VALUES(?,?,?,?,?,?)', (APP, release_id, kind, descriptor['sha256'], 'machine-monitor/artifact-parts/v2', PIECE_SIZE))
+            protocol = api.query('SELECT descriptor_schema,part_size FROM artifact_protocols WHERE app_id=? AND release_id=? AND kind=? AND artifact_sha256=?', (APP, release_id, kind, descriptor['sha256']))
+            if protocol != [{'descriptor_schema': 'machine-monitor/artifact-parts/v2', 'part_size': PIECE_SIZE}]:
+                raise DeliveryError('Immutable artifact protocol already differs.')
             api.query('INSERT OR IGNORE INTO artifact_parts VALUES(?,?,?,?,?)', (APP, release_id, kind, descriptor['sha256'], serialized_parts))
             existing = api.query('SELECT parts_json FROM artifact_parts WHERE app_id=? AND release_id=? AND kind=? AND artifact_sha256=?', (APP, release_id, kind, descriptor['sha256']))
             if len(existing) != 1 or existing[0]['parts_json'] != serialized_parts:

@@ -3,7 +3,7 @@ import {readFileSync} from 'node:fs';
 import {fixture} from './update_worker.mjs';
 import worker from '../../delivery/worker.mjs';
 const f=fixture();let mode='normal',received=0,aborted=0;
-const large=Buffer.alloc(1024*1024+47,7),release=f.makeRelease('stable','browser-multi');
+const large=Buffer.alloc(256*1024+47,7),release=f.makeRelease('stable','browser-multi');
 const {hash}=await import('./update_worker.mjs');
 release.first_install.size=large.length;release.first_install.sha256=hash(large);
 f.partRows(release,'archive',f.archive);f.partRows(release,'package',large);

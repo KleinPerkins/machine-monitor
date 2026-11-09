@@ -56,3 +56,17 @@ CREATE TRIGGER IF NOT EXISTS parts_immutable_update BEFORE UPDATE ON artifact_pa
 BEGIN SELECT RAISE(ABORT,'immutable parts'); END;
 CREATE TRIGGER IF NOT EXISTS parts_immutable_delete BEFORE DELETE ON artifact_parts
 BEGIN SELECT RAISE(ABORT,'immutable parts'); END;
+
+-- Explicit immutable protocol identity keeps even tiny legacy artifacts retention-only.
+CREATE TABLE IF NOT EXISTS artifact_protocols (
+  app_id TEXT NOT NULL, release_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('archive','package')),
+  artifact_sha256 TEXT NOT NULL CHECK(length(artifact_sha256)=64),
+  descriptor_schema TEXT NOT NULL CHECK(descriptor_schema='machine-monitor/artifact-parts/v2'),
+  part_size INTEGER NOT NULL CHECK(part_size=262144),
+  PRIMARY KEY(app_id,release_id,kind,artifact_sha256)
+);
+CREATE TRIGGER IF NOT EXISTS protocol_immutable_update BEFORE UPDATE ON artifact_protocols
+BEGIN SELECT RAISE(ABORT,'immutable protocol'); END;
+CREATE TRIGGER IF NOT EXISTS protocol_immutable_delete BEFORE DELETE ON artifact_protocols
+BEGIN SELECT RAISE(ABORT,'immutable protocol'); END;

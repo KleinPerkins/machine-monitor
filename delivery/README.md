@@ -16,7 +16,7 @@ credential exclusively in `Authorization: Bearer …`, never a URL or cookie.
 | `POST /v1/access/check` | JSON `{app_id, channel}`; returns `schema=machine-monitor/access-status/v1`, `app_id`, `channel`, opaque `grant_id`, integer Unix-seconds `expires_at` |
 | `GET /v1/apps/{app}/channels/{stable\|qualification}/manifest` | Exact current release JSON; authorization and release selection share one primary D1 query |
 | `GET /v1/apps/{app}/releases/{release}/{archive\|package}/parts` | Closed descriptor binding ordered piece indexes, sizes and hashes to the authorized ZIP |
-| `GET`/`HEAD /v1/apps/{app}/releases/{release}/{archive\|package}/parts/{index}` | One independently authenticated piece, at most 1 MiB |
+| `GET`/`HEAD /v1/apps/{app}/releases/{release}/{archive\|package}/parts/{index}` | One independently authenticated piece, at most 256 KiB |
 | Unsuffixed `archive`/`package` locators | Unavailable after authorization; no whole-file concatenation fallback |
 
 Release JSON follows `machine-monitor/release/v1`. Both `archive` and required
@@ -30,11 +30,11 @@ ignore the first-install package for updates. The browser hashes the first-insta
 package against the authorized manifest; macOS verifies the signed applications
 on opening. Native updater signature and code/platform checks remain mandatory.
 
-`machine-monitor/artifact-parts/v1` has exactly `schema`, `app_id`, `release_id`,
-`kind`, `artifact_sha256`, `artifact_size`, `part_size=1048576` and `parts`.
+`machine-monitor/artifact-parts/v2` has exactly `schema`, `app_id`, `release_id`,
+`kind`, `artifact_sha256`, `artifact_size`, `part_size=262144` and `parts`.
 Each part has exactly `{index,size,sha256}` with contiguous zero-based indexes,
-at most 512 entries and exact full-size non-final pieces. Metadata is bounded to
-128 KiB; duplicate/unknown keys, incorrect identity, totals and bounds are rejected.
+at most 2048 entries and exact full-size non-final pieces. Metadata is bounded to
+256 KiB; duplicate/unknown keys, incorrect identity, totals and bounds are rejected.
 Native and browser downloaders validate each piece and assemble the ZIP locally
 within one 300-second operation deadline. Cancellation removes the native owned
 partial file or browser references. Native full-ZIP SHA256/Ed25519 verification
@@ -146,7 +146,7 @@ for requests rejected when a library-default identifier is used.
   The owner shares access files privately; this tool sends no messages.
 - `publish --manifest /private/release.json --receipt /private/qualification.json --archive /private/update.zip --package /private/first-install.zip`
   validates qualification evidence and full artifact sizes/hashes; splits each ZIP
-  into ordered pieces of at most **1 MiB**, below the 25-MiB file limit; retains
+  into ordered pieces of at most **256 KiB**, below the 25-MiB file limit; retains
   the full asset set and deploys it **before** publishing any D1 release/channel.
   Immutable D1 part metadata binds each ordered path/length/hash to app, release,
   kind and full-artifact hash. The full SHA256/Ed25519 manifest descriptors and
@@ -170,8 +170,10 @@ Every later deployment preserves **all** previously deployed and D1-referenced
 parts, including current, candidate and required rollback assets. There is no
 retention deletion operation or automatic garbage collection. Preflight hashes
 all local retained files and rejects more than 20,000 assets or any file over
-20 MiB, preserving old immutable assets without serving old aggregate requests.
-New artifacts remain bounded to 512 MiB (at most 512 one-MiB pieces); both
+20 MiB, preserving old 20-MiB and one-MiB immutable layouts without serving their byte requests.
+Internal compact parts metadata is bounded separately to 1 MiB; wire metadata is
+bounded to 256 KiB. Canonical indexes range from 0 through 2047.
+New artifacts remain bounded to 512 MiB (at most 2048 quarter-MiB pieces); both
 ZIPs/candidates/rollback sets count toward the file bound. Empty initial asset
 sets are supported if the pinned provider tool accepts them; failure is a blocker.
 Direct `Cloudflare` mutation methods enforce the same Free gate. Narrow guarded
@@ -191,7 +193,7 @@ same bytes. A JSON assertion is not actual qualification evidence.
 The Worker authenticates in the **first query of a fresh first-primary D1
 session**, before any asset binding fetch. It constructs credential-free internal
 piece requests and checks status/length. Each byte request reads at most one
-1-MiB piece plus a guard byte, with 30-second fetch/read bounds and an EOF check
+256-KiB piece plus a guard byte, with 30-second fetch/read bounds and an EOF check
 before success. It never concatenates or hashes a complete artifact. Each request
 has one authorization query and at most one asset fetch, independent of ZIP size.
 Missing/truncated/oversized/quota-failed pieces fail unavailable; recipient
@@ -268,3 +270,14 @@ Primary implementation references:
 Pinned-source checks for this owner-auth path: [4.158.0 auth command](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.158.0/packages/wrangler/src/user/commands.ts), [JSON logger and disk-log opt-out](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.158.0/packages/wrangler/src/logger.ts).
 
 Account-owned primary origin reference: [Get a Workers Subdomain](https://developers.cloudflare.com/api/resources/workers/subresources/subdomains/methods/get/).
+
+Descriptor-v2 artifacts carry an explicit append-only protocol identity. Legacy
+20-MiB and one-MiB records, including single-piece artifacts, remain retention-only;
+publication refuses to relabel them under their existing immutable release identity.
+
+For a descriptor-v1 deployment, run the reviewed owner `deploy` command before
+the first v2 publication. It applies the additive protocol table and deploys the
+new Worker before any v2 metadata/pointer is written. Publication refuses an
+unmigrated database. Marker insertion/verification precedes immutable part rows,
+so an interrupted new publication can retry without treating unmarked legacy
+rows as eligible. Channel advancement remains after complete readback.

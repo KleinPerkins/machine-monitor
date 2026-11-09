@@ -1,4 +1,4 @@
-import {APP, TOKEN, ID, origin, manifest, sha256, parts, PIECE_SIZE, pieceDescriptor} from './contract.mjs';
+import {APP, TOKEN, ID, origin, manifest, sha256, parts, PIECE_SIZE, MAX_PIECES, INTERNAL_LIMIT, pieceDescriptor} from './contract.mjs';
 import {PAGE, CLIENT} from './web.mjs';
 const POLICY = {
   'Cache-Control':'private, no-store, max-age=0', 'CDN-Cache-Control':'no-store',
@@ -94,7 +94,7 @@ export default {async fetch(request, env, ctx) {
     if(request.method==='GET' && url.pathname==='/download.js') return new Response(CLIENT,{headers:{...POLICY,'Content-Type':'text/javascript; charset=utf-8'}});
     const accessRoute=url.pathname==='/v1/access/check';
     const m=url.pathname.match(/^\/v1\/apps\/([A-Za-z0-9._-]+)\/channels\/(stable|qualification)\/manifest$/);
-    const a=url.pathname.match(/^\/v1\/apps\/([A-Za-z0-9._-]+)\/releases\/([A-Za-z0-9._-]+)\/(archive|package)(?:\/(parts)(?:\/(0|[1-9][0-9]{0,2}))?)?$/);
+    const a=url.pathname.match(/^\/v1\/apps\/([A-Za-z0-9._-]+)\/releases\/([A-Za-z0-9._-]+)\/(archive|package)(?:\/(parts)(?:\/(0|[1-9][0-9]{0,3}))?)?$/);
     if(!accessRoute&&!m&&!a) return reply({error:'not_found'},404);
     if((accessRoute&&request.method!=='POST')||(m&&request.method!=='GET')||(a&&(!['GET','HEAD'].includes(request.method)||(a[4]&&a[5]===undefined&&request.method!=='GET'))))return reply({error:'method_not_allowed'},405);
     const match=request.headers.get('Authorization')?.match(/^Bearer ([A-Za-z0-9_-]{43})$/);
@@ -113,9 +113,11 @@ export default {async fetch(request, env, ctx) {
         WHERE c.app_id=? AND c.channel=? AND EXISTS(SELECT 1 ${auth})`,[m[1],m[2],hash,m[1],m[2],now]);
     }else{
       if(!ID.test(a[2]))return deny();
-      row=await primary(env,`SELECT r.*,p.parts_json FROM releases r LEFT JOIN artifact_parts p
+      row=await primary(env,`SELECT r.*,p.parts_json,t.descriptor_schema,t.part_size FROM releases r LEFT JOIN artifact_parts p
         ON p.app_id=r.app_id AND p.release_id=r.release_id AND p.kind='${a[3]}'
         AND p.artifact_sha256=json_extract(r.manifest_json,'$.${a[3]==='package'?'first_install':'archive'}.sha256')
+        LEFT JOIN artifact_protocols t ON t.app_id=p.app_id AND t.release_id=p.release_id
+        AND t.kind=p.kind AND t.artifact_sha256=p.artifact_sha256
         WHERE r.app_id=? AND r.release_id=?
         AND EXISTS(SELECT 1 FROM grants g JOIN entitlements e ON e.grant_id=g.grant_id
           WHERE g.token_hash=? AND e.app_id=r.app_id AND e.channel=r.channel AND g.revoked_at IS NULL
@@ -129,7 +131,8 @@ export default {async fetch(request, env, ctx) {
        row.object_key!==`${APP}/${release.archive.sha256}.zip`)throw new Error('manifest');
     if(m)return reply(release);
     const artifact=a[3]==='package'?release.first_install:release.archive;
-    if(typeof row.parts_json!=='string'||row.parts_json.length>524288)throw new Error('parts');
+    if(row.descriptor_schema!=='machine-monitor/artifact-parts/v2'||row.part_size!==PIECE_SIZE)throw new Error('legacy transport');
+    if(typeof row.parts_json!=='string'||row.parts_json.length>INTERNAL_LIMIT)throw new Error('parts');
     const ordered=parts(JSON.parse(row.parts_json),APP,row.release_id,a[3],artifact);
     // Owner publication stores compact JSON with scalar-only, closed part rows.
     // After validating that flat shape, native round-trip equality rejects
@@ -142,13 +145,14 @@ export default {async fetch(request, env, ctx) {
     // Legacy aggregate locators are identities only; old owner-only builds must
     // not retain an unqualified expensive concatenation path.
     if(!a[4])throw new Error('aggregate unavailable');
-    // Retention also understands legacy20MiB rows; every current route,
-    // including HEAD, requires the bounded1MiB layout before reading any asset.
+    // Retention also understands legacy20MiB and1MiB rows; every current route,
+    // including HEAD, requires the bounded256KiB layout before reading any asset.
     if(ordered.length!==Math.ceil(artifact.size/PIECE_SIZE)||
        ordered.some((p,i)=>p.size>PIECE_SIZE||(i<ordered.length-1&&p.size!==PIECE_SIZE)))throw new Error('pieces');
-    if(a[5]===undefined)return reply(pieceDescriptor({schema:'machine-monitor/artifact-parts/v1',app_id:APP,release_id:a[2],kind:a[3],
+    if(a[5]===undefined)return reply(pieceDescriptor({schema:'machine-monitor/artifact-parts/v2',app_id:APP,release_id:a[2],kind:a[3],
       artifact_sha256:artifact.sha256,artifact_size:artifact.size,part_size:PIECE_SIZE,
       parts:ordered.map(({index,size,sha256})=>({index,size,sha256}))},artifact));
+    if(Number(a[5])>=MAX_PIECES)return reply({error:'invalid_piece'},400);
     const part=ordered[Number(a[5])];
     if(!part)return reply({error:'invalid_piece'},400);
     const response=await asset(env,approved,part,request.method,request.signal);

@@ -170,7 +170,7 @@ def lifecycle():
             expect(page.locator('#status')).to_contain_text(message)
             if scenario == 'multi':
                 assert any('/parts/1' in url for url in requests)
-                assert page.evaluate("window.fixtureLastBlob.size") == 1024*1024+47
+                assert page.evaluate("window.fixtureLastBlob.size") == 256*1024+47
                 page.locator('#reset').click()
             else:
                 expect(page.locator('#save')).to_be_hidden()
