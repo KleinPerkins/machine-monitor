@@ -1,4 +1,4 @@
-import {APP, TOKEN, ID, origin, manifest, sha256, parts} from './contract.mjs';
+import {APP, TOKEN, ID, origin, manifest, sha256, parts, PIECE_SIZE, pieceDescriptor, parseWireJSON} from './contract.mjs';
 import {PAGE, CLIENT} from './web.mjs';
 const POLICY = {
   'Cache-Control':'private, no-store, max-age=0', 'CDN-Cache-Control':'no-store',
@@ -25,7 +25,7 @@ async function asset(env, approved, part, method, signal) {
     if(signal?.aborted)throw new Error('cancelled');
     const response=await timed(env.ASSETS.fetch(new Request(approved+part.path,{method,signal:abort.signal})),cancel);
     // Static Assets may omit Content-Length. Reject an inconsistent declaration;
-    // multipart() always enforces the immutable size on the actual streamed body.
+    // pieceBytes() enforces the immutable size and EOF before emitting bytes.
     const length=response.headers.get('Content-Length');
     if(response.status!==200 || (length!==null && length!==String(part.size)) || response.headers.get('Content-Encoding')) {
       await response.body?.cancel();throw new Error('asset');
@@ -33,54 +33,38 @@ async function asset(env, approved, part, method, signal) {
     return response;
   }finally {signal?.removeEventListener('abort',cancel);}
 }
-async function multipart(env, approved, ordered, signal, ctx) {
-  const first=await asset(env,approved,ordered[0],'GET',signal);
-  if(!first.body)throw new Error('asset');
-  const output=new FixedLengthStream(ordered.reduce((size,part)=>size+part.size,0));
-  const writer=output.writable.getWriter();
-  let reader=null,cancelled=false,buffer;
-  const cancel=()=>{cancelled=true;reader?.cancel().catch(()=>{});};
-  const abort=()=>{cancel();writer.abort(new Error('cancelled')).catch(()=>{});};
-  signal?.addEventListener('abort',abort,{once:true});writer.closed.catch(cancel);
-  const task=(async()=>{
-    for(let index=0;index<ordered.length;index++) {
-      const response=index===0?first:await asset(env,approved,ordered[index],'GET',signal);
-      if(!response.body)throw new Error('asset');
-      let byob=false;
-      try {reader=response.body.getReader({mode:'byob'});byob=true;}catch {reader=response.body.getReader();}
-      const native=byob&&typeof reader.readAtLeast==='function';let consumed=0;
-      while(consumed<ordered[index].size) {
+async function pieceBytes(response,part,signal) {
+  if(!response.body||part.size>PIECE_SIZE)throw new Error('asset');
+  let reader,native=false;
+  try{reader=response.body.getReader({mode:'byob'});native=typeof reader.readAtLeast==='function';if(!native){reader.releaseLock();reader=null;}}catch{}
+  reader??=response.body.getReader();
+  let bytes=new Uint8Array(part.size+1),count=0,cancelled=false;
+  const cancel=()=>{cancelled=true;reader.cancel().catch(()=>{});};
+  signal?.addEventListener('abort',cancel,{once:true});
+  try {
+    if(signal?.aborted)throw new Error('cancelled');
+    return await timed((async()=>{
+      while(true){
         if(cancelled||signal?.aborted)throw new Error('cancelled');
-        let operation;
-        if(native) {buffer??=new Uint8Array(4*1024*1024);operation=reader.readAtLeast(Math.min(buffer.length,ordered[index].size-consumed),buffer);}
-        else if(byob) {const bytes=new Uint8Array(4*1024*1024);operation=reader.read(bytes,{min:Math.min(bytes.length,ordered[index].size-consumed)});}
-        else operation=reader.read();
-        const item=await timed(operation,cancel);
-        if(cancelled||!item.value?.byteLength||consumed+item.value.byteLength>ordered[index].size)throw new Error('length');
-        consumed+=item.value.byteLength;
-        if(item.done&&consumed!==ordered[index].size)throw new Error('length');
-        if(consumed===ordered[index].size&&!item.done) {
-          // Check EOF before publishing this part's last bytes. Extra data must
-          // never appear to be a valid complete response merely by its prefix.
-          const end=await timed(native?reader.readAtLeast(1,new Uint8Array(1)):byob?reader.read(new Uint8Array(1),{min:1}):reader.read(),cancel);
-          if(cancelled||signal?.aborted||!end.done||end.value?.byteLength)throw new Error('length');
-        }
+        const view=count?new Uint8Array(1):bytes;
+        const item=await(native?reader.readAtLeast(view.length,view):reader.read());
         if(cancelled||signal?.aborted)throw new Error('cancelled');
-        await timed(writer.write(item.value),abort);
-        // Workerd identity writes copy their bytes and settle on consumption.
-        // Reuse only on its native BYOB path; generic streams get fresh buffers.
-        if(native)buffer=new Uint8Array(item.value.buffer);
+        if(item.value?.byteLength){
+          if(count+item.value.byteLength>part.size)throw new Error('length');
+          // Native BYOB may transfer the supplied buffer. Retain its returned
+          // storage rather than writing to a detached original view.
+          if(native&&count===0)bytes=new Uint8Array(item.value.buffer,item.value.byteOffset,item.value.byteLength);
+          else bytes.set(item.value,count);
+          count+=item.value.byteLength;
+        }else if(!item.done)throw new Error('length');
+        if(item.done)break;
       }
-      reader.releaseLock();reader=null;
-    }
-    await writer.close();
-  })().catch(async()=>{await writer.abort(new Error('incomplete artifact')).catch(()=>{});}).finally(async()=>{
-    signal?.removeEventListener('abort',abort);
-    if(reader){await reader.cancel().catch(()=>{});reader.releaseLock();reader=null;}
-    writer.releaseLock();
-  });
-  ctx?.waitUntil(task);
-  return output.readable;
+      if(cancelled||signal?.aborted||count!==part.size)throw new Error('length');
+      return bytes.subarray(0,count);
+    })(),cancel);
+  } finally {
+    signal?.removeEventListener('abort',cancel);await reader.cancel().catch(()=>{});reader.releaseLock();
+  }
 }
 const auth = `FROM grants g JOIN entitlements e ON e.grant_id=g.grant_id
  WHERE g.token_hash=? AND e.app_id=? AND e.channel=? AND g.revoked_at IS NULL
@@ -110,9 +94,9 @@ export default {async fetch(request, env, ctx) {
     if(request.method==='GET' && url.pathname==='/download.js') return new Response(CLIENT,{headers:{...POLICY,'Content-Type':'text/javascript; charset=utf-8'}});
     const accessRoute=url.pathname==='/v1/access/check';
     const m=url.pathname.match(/^\/v1\/apps\/([A-Za-z0-9._-]+)\/channels\/(stable|qualification)\/manifest$/);
-    const a=url.pathname.match(/^\/v1\/apps\/([A-Za-z0-9._-]+)\/releases\/([A-Za-z0-9._-]+)\/(archive|package)$/);
+    const a=url.pathname.match(/^\/v1\/apps\/([A-Za-z0-9._-]+)\/releases\/([A-Za-z0-9._-]+)\/(archive|package)(?:\/(parts)(?:\/(0|[1-9][0-9]{0,2}))?)?$/);
     if(!accessRoute&&!m&&!a) return reply({error:'not_found'},404);
-    if((accessRoute&&request.method!=='POST')||(m&&request.method!=='GET')||(a&&!['GET','HEAD'].includes(request.method)))return reply({error:'method_not_allowed'},405);
+    if((accessRoute&&request.method!=='POST')||(m&&request.method!=='GET')||(a&&(!['GET','HEAD'].includes(request.method)||(a[4]&&a[5]===undefined&&request.method!=='GET'))))return reply({error:'method_not_allowed'},405);
     const match=request.headers.get('Authorization')?.match(/^Bearer ([A-Za-z0-9_-]{43})$/);
     if(!match || !TOKEN.test(match[1]))return deny();
     const hash=await sha256(new TextEncoder().encode(match[1])),now=Math.floor(Date.now()/1000);
@@ -145,16 +129,23 @@ export default {async fetch(request, env, ctx) {
        row.object_key!==`${APP}/${release.archive.sha256}.zip`)throw new Error('manifest');
     if(m)return reply(release);
     const artifact=a[3]==='package'?release.first_install:release.archive;
-    const ordered=parts(JSON.parse(row.parts_json),APP,row.release_id,a[3],artifact);
+    if(typeof row.parts_json!=='string'||row.parts_json.length>524288)throw new Error('parts');
+    const ordered=parts(parseWireJSON(row.parts_json),APP,row.release_id,a[3],artifact);
     // Conditional/range requests authorize first; never return a cached 304.
     if(request.headers.has('Range'))return reply({error:'ranges_unsupported'},416,{'Accept-Ranges':'none'});
     if([...request.headers.keys()].some(k=>k.startsWith('if-')))return reply({error:'conditions_unsupported'},400);
-    let body=null;
-    if(request.method==='HEAD') {
-      for(const part of ordered)await asset(env,approved,part,'HEAD',request.signal);
-    } else body=await multipart(env,approved,ordered,request.signal,ctx);
+    // Legacy aggregate locators are identities only; old owner-only builds must
+    // not retain an unqualified expensive concatenation path.
+    if(!a[4])throw new Error('aggregate unavailable');
+    const descriptor=pieceDescriptor({schema:'machine-monitor/artifact-parts/v1',app_id:APP,release_id:a[2],kind:a[3],
+      artifact_sha256:artifact.sha256,artifact_size:artifact.size,part_size:PIECE_SIZE,
+      parts:ordered.map(({index,size,sha256})=>({index,size,sha256}))},artifact);
+    if(a[5]===undefined)return reply(descriptor);
+    const part=ordered[Number(a[5])];
+    if(!part)return reply({error:'invalid_piece'},400);
+    const response=await asset(env,approved,part,request.method,request.signal);
+    const body=request.method==='HEAD'?null:await pieceBytes(response,part,request.signal);
     return new Response(body,{headers:{...POLICY,
-      'Content-Type':'application/zip','Content-Length':String(artifact.size),
-      'Content-Disposition':'attachment; filename="Machine-Monitor.zip"','Accept-Ranges':'none'}});
+      'Content-Type':'application/octet-stream','Content-Length':String(part.size),'Accept-Ranges':'none'}});
   } catch {return reply({error:'service_unavailable'},503,{'Retry-After':'30'});}
 }};

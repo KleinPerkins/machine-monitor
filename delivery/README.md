@@ -15,18 +15,30 @@ credential exclusively in `Authorization: Bearer …`, never a URL or cookie.
 | --- | --- |
 | `POST /v1/access/check` | JSON `{app_id, channel}`; returns `schema=machine-monitor/access-status/v1`, `app_id`, `channel`, opaque `grant_id`, integer Unix-seconds `expires_at` |
 | `GET /v1/apps/{app}/channels/{stable\|qualification}/manifest` | Exact current release JSON; authorization and release selection share one primary D1 query |
-| `GET`/`HEAD /v1/apps/{app}/releases/{release}/archive` | One-main-app updater ZIP, authenticated for the release's channel |
-| `GET`/`HEAD /v1/apps/{app}/releases/{release}/package` | First-install ZIP containing main app, separate Recovery app and Finder instructions; independently authenticated |
+| `GET /v1/apps/{app}/releases/{release}/{archive\|package}/parts` | Closed descriptor binding ordered piece indexes, sizes and hashes to the authorized ZIP |
+| `GET`/`HEAD /v1/apps/{app}/releases/{release}/{archive\|package}/parts/{index}` | One independently authenticated piece, at most 1 MiB |
+| Unsuffixed `archive`/`package` locators | Unavailable after authorization; no whole-file concatenation fallback |
 
 Release JSON follows `machine-monitor/release/v1`. Both `archive` and required
 `first_install` descriptors have `{path,size,sha256,ed25519_signature}`; paths use
-exact same-origin `archive` and `package` routes with the same release ID. The app,
+exact same-origin `archive` and `package` locators with the same release ID. Clients
+append `/parts` and `/parts/{index}`; response data cannot select another URL. The app,
 bundle, team, platform, schema and origin trust invariants are fixed by the
 accepted interface. The closed version string is one to four numeric components without leading zeros; release and qualification IDs use one to 128 ASCII letters, digits, underscores or hyphens. Build
 is a positive safe integer. Archives are bounded to 512 MiB. Native consumers
 ignore the first-install package for updates. The browser hashes the first-install
 package against the authorized manifest; macOS verifies the signed applications
 on opening. Native updater signature and code/platform checks remain mandatory.
+
+`machine-monitor/artifact-parts/v1` has exactly `schema`, `app_id`, `release_id`,
+`kind`, `artifact_sha256`, `artifact_size`, `part_size=1048576` and `parts`.
+Each part has exactly `{index,size,sha256}` with contiguous zero-based indexes,
+at most 512 entries and exact full-size non-final pieces. Metadata is bounded to
+128 KiB; duplicate/unknown keys, incorrect identity, totals and bounds are rejected.
+Native and browser downloaders validate each piece and assemble the ZIP locally
+within one 300-second operation deadline. Cancellation removes the native owned
+partial file or browser references. Native full-ZIP SHA256/Ed25519 verification
+and code validation still precede installation.
 
 Every protected request creates a fresh `DB.withSession('first-primary')` and
 performs authorization in its first query. A session's subsequent reads may use
@@ -134,12 +146,12 @@ for requests rejected when a library-default identifier is used.
   The owner shares access files privately; this tool sends no messages.
 - `publish --manifest /private/release.json --receipt /private/qualification.json --archive /private/update.zip --package /private/first-install.zip`
   validates qualification evidence and full artifact sizes/hashes; splits each ZIP
-  into ordered parts of at most **20 MiB**, below the 25-MiB file limit; retains
+  into ordered pieces of at most **1 MiB**, below the 25-MiB file limit; retains
   the full asset set and deploys it **before** publishing any D1 release/channel.
   Immutable D1 part metadata binds each ordered path/length/hash to app, release,
   kind and full-artifact hash. The full SHA256/Ed25519 manifest descriptors and
-  authenticated archive/package URLs are unchanged. A temporary owner-only
-  qualification grant reads complete bytes back through those protected URLs;
+  archive/package identity locators are unchanged. A temporary owner-only
+  qualification grant reads the descriptor and every authenticated piece back;
   exact hash/length verification precedes channel advancement. A readback failure
   may retain an immutable qualification row but never advances its channel.
 - Stable publication uses the same command with stable/qualified manifest and no
@@ -152,7 +164,8 @@ Every later deployment preserves **all** previously deployed and D1-referenced
 parts, including current, candidate and required rollback assets. There is no
 retention deletion operation or automatic garbage collection. Preflight hashes
 all local retained files and rejects more than 20,000 assets or any file over
-20 MiB. A complete artifact remains bounded to 512 MiB (at most 26 parts); both
+20 MiB, preserving old immutable assets without serving old aggregate requests.
+New artifacts remain bounded to 512 MiB (at most 512 one-MiB pieces); both
 ZIPs/candidates/rollback sets count toward the file bound. Empty initial asset
 sets are supported if the pinned provider tool accepts them; failure is a blocker.
 Direct `Cloudflare` mutation methods enforce the same Free gate. Narrow guarded
@@ -171,9 +184,11 @@ same bytes. A JSON assertion is not actual qualification evidence.
 
 The Worker authenticates in the **first query of a fresh first-primary D1
 session**, before any asset binding fetch. It constructs credential-free internal
-part requests, checks status/length, streams one part at a time with backpressure,
-30-second fetch/read bounds and at most 26 part requests. It never buffers/hashes
-an entire artifact. Missing/truncated/oversized/quota-failed parts abort; recipient
+piece requests and checks status/length. Each byte request reads at most one
+1-MiB piece plus a guard byte, with 30-second fetch/read bounds and an EOF check
+before success. It never concatenates or hashes a complete artifact. Each request
+has one authorization query and at most one asset fetch, independent of ZIP size.
+Missing/truncated/oversized/quota-failed pieces fail unavailable; recipient
 full hash/signature validation rejects incomplete or tampered bytes. Cancellation
 stops the current reader. External guessed part paths deny, even with a token.
 Conditional requests deny after authorization; ranges return 416. Override

@@ -3,6 +3,11 @@ import {readFileSync} from 'node:fs';
 import {fixture} from './update_worker.mjs';
 import worker from '../../delivery/worker.mjs';
 const f=fixture();let mode='normal',received=0,aborted=0;
+const large=Buffer.alloc(1024*1024+47,7),release=f.makeRelease('stable','browser-multi');
+const {hash}=await import('./update_worker.mjs');
+release.first_install.size=large.length;release.first_install.sha256=hash(large);
+f.partRows(release,'archive',f.archive);f.partRows(release,'package',large);
+f.db.prepare('INSERT INTO releases VALUES(?,?,?,?,?,?,?,?,?)').run(release.app_id,'browser-multi','stable',JSON.stringify(release),release.archive.sha256,release.archive.size,`${release.app_id}/${release.archive.sha256}.zip`,release.qualification_id,'{}');
 const pending=new Set();
 const realFetch=f.env.ASSETS.fetch.bind(f.env.ASSETS);
 f.env.ASSETS.fetch=async request=>{
@@ -20,8 +25,8 @@ const server=https.createServer({key:readFileSync(process.argv[2]),cert:readFile
   try{
     if(req.url==='/fixture-state'){
       let text='';for await(const c of req)text+=c;
-      if(req.method==='POST'){const value=JSON.parse(text);mode=value.mode||'normal';f.db.prepare('UPDATE grants SET revoked_at=? WHERE grant_id=?').run(mode==='revoked'?1:null,'friend');}
-      res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({mode,received,aborted}));return;
+      if(req.method==='POST'){const value=JSON.parse(text);mode=value.mode||'normal';f.db.prepare('UPDATE grants SET revoked_at=? WHERE grant_id=?').run(mode==='revoked'?1:null,'friend');f.db.prepare("UPDATE channels SET release_id=? WHERE channel='stable'").run(['multi','revoke-next'].includes(mode)?'browser-multi':'release-2');}
+      res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({mode,received,aborted,pending:pending.size}));return;
     }
     const port=server.address().port,base=`https://127.0.0.1:${port}`;f.env.UPDATE_ORIGIN=base;
     const protectedPath=req.url.startsWith('/v1/');if(protectedPath)received++;
@@ -29,8 +34,10 @@ const server=https.createServer({key:readFileSync(process.argv[2]),cert:readFile
     if(protectedPath&&mode==='redirect'){res.writeHead(302,{Location:'https://forbidden.example.invalid/'});res.end();return;}
     if(req.url==='/favicon.ico'){res.writeHead(404);res.end();return;}
     const chunks=[];for await(const c of req)chunks.push(c);const body=Buffer.concat(chunks);
-    const request=new Request(base+req.url,{method:req.method,headers:req.headers,...(body.length?{body}: {})});
+    const abort=new AbortController();res.on('close',()=>{if(!res.writableEnded)abort.abort();});
+    const request=new Request(base+req.url,{method:req.method,headers:req.headers,signal:abort.signal,...(body.length?{body}: {})});
     const response=await worker.fetch(request,f.env);
+    if(mode==='revoke-next'&&req.url.endsWith('/package/parts/0')&&response.status===200)f.db.prepare("UPDATE grants SET revoked_at=1 WHERE grant_id='friend'").run();
     if(res.destroyed)return;res.writeHead(response.status,Object.fromEntries(response.headers));
     if(!response.body){res.end();return;}
     const reader=response.body.getReader();let closed=false;

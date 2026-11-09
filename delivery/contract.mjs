@@ -45,16 +45,49 @@ export async function sha256(bytes) {
 
 // Immutable publication-only metadata. Full archive hashes/signatures stay on wire.
 export const PART_SIZE=20*1024*1024;
+export const PIECE_SIZE=1024*1024;
 export function parts(value,app,release,kind,descriptor) {
-  if(!Array.isArray(value)||value.length<1||value.length>26)throw new Error('parts');
+  if(!Array.isArray(value)||value.length<1||value.length>512)throw new Error('parts');
+  const stride=value[0]?.size;
+  if(value.length>1&&![PART_SIZE,PIECE_SIZE].includes(stride))throw new Error('parts');
   let total=0;
   value.forEach((part,index)=>{
     if(!part || Object.keys(part).sort().join(',')!=='index,path,sha256,size' || part.index!==index ||
       !Number.isSafeInteger(part.size)||part.size<1||part.size>PART_SIZE ||
-      (index<value.length-1&&part.size!==PART_SIZE) || !/^[a-f0-9]{64}$/.test(part.sha256) ||
+      (index<value.length-1&&part.size!==stride) || !/^[a-f0-9]{64}$/.test(part.sha256) ||
       part.path!==`/_private/${app}/${release}/${kind}/${descriptor.sha256}/${index}-${part.sha256}.part`)throw new Error('parts');
     total+=part.size;
   });
   if(total!==descriptor.size)throw new Error('parts');
   return value;
+}
+
+export function pieceDescriptor(value,descriptor) {
+  const kind=descriptor.path.split('/').at(-1),release=descriptor.path.split('/').at(-2);
+  validateDescriptor(descriptor,APP,release,kind);
+  if(!['archive','package'].includes(kind)||!value||Object.keys(value).sort().join(',')!=='app_id,artifact_sha256,artifact_size,kind,part_size,parts,release_id,schema'||
+     value.schema!=='machine-monitor/artifact-parts/v1'||value.app_id!==APP||value.release_id!==release||value.kind!==kind||
+     value.artifact_sha256!==descriptor.sha256||value.artifact_size!==descriptor.size||value.part_size!==PIECE_SIZE||
+     !Array.isArray(value.parts)||value.parts.length!==Math.ceil(descriptor.size/PIECE_SIZE)||value.parts.length>512)throw new Error('pieces');
+  let total=0;
+  value.parts.forEach((p,i)=>{
+    if(!p||Object.keys(p).sort().join(',')!=='index,sha256,size'||!Number.isSafeInteger(p.index)||p.index!==i||
+       !Number.isSafeInteger(p.size)||p.size<1||p.size>PIECE_SIZE||(i<value.parts.length-1&&p.size!==PIECE_SIZE)||
+       !/^[a-f0-9]{64}$/.test(p.sha256))throw new Error('pieces');
+    total+=p.size;
+  });
+  if(total!==descriptor.size)throw new Error('pieces');
+  return value;
+}
+
+// Reject duplicate keys, including escaped aliases, before JSON.parse can hide them.
+export function parseWireJSON(text) {
+  let i=0;
+  const ws=()=>{while(/[\t\n\r ]/.test(text[i]??'x'))i++;};
+  const string=()=>{const start=i;if(text[i++]!=='"')throw new Error('json');let escaped=false;while(i<text.length){const c=text[i++];if(c==='"'&&!escaped)return JSON.parse(text.slice(start,i));if(c.charCodeAt(0)<32)throw new Error('json');if(escaped)escaped=false;else if(c==='\\')escaped=true;}throw new Error('json');};
+  function value(depth){ws();if(depth>24)throw new Error('json');const c=text[i];
+    if(c==='{'){i++;ws();const keys=new Set();if(text[i]==='}'){i++;return;}while(true){ws();const key=string();if(keys.has(key))throw new Error('json');keys.add(key);ws();if(text[i++]!==':')throw new Error('json');value(depth+1);ws();if(text[i]==='}'){i++;return;}if(text[i++]!==',')throw new Error('json');}}
+    else if(c==='['){i++;ws();if(text[i]===']'){i++;return;}while(true){value(depth+1);ws();if(text[i]===']'){i++;return;}if(text[i++]!==',')throw new Error('json');}}
+    else if(c==='"')string();else{const start=i;while(i<text.length&&!/[\t\n\r ,}\]]/.test(text[i]))i++;if(start===i)throw new Error('json');JSON.parse(text.slice(start,i));}}
+  value(0);ws();if(i!==text.length)throw new Error('json');return JSON.parse(text);
 }

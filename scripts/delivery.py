@@ -28,6 +28,7 @@ APP = 'com.kleinperkins.machine-monitor'
 WRANGLER = '4.158.0'
 MAX_ARCHIVE = 512 * 1024 * 1024
 PART_SIZE = 20 * 1024 * 1024
+PIECE_SIZE = 1024 * 1024
 MAX_FILES = 20000
 FREE_PROOF_MAX_AGE = 3600
 CHECKS = ('ci_required', 'merged_source', 'developer_id', 'notarization',
@@ -158,7 +159,7 @@ def asset_inventory(config):
                 raise DeliveryError('Private asset directories must have mode 0700.')
             continue
         relative = '/' + path.relative_to(root).as_posix()
-        pattern = r'/_private/' + re.escape(APP) + r'/[A-Za-z0-9_-]{1,128}/(?:archive|package)/[a-f0-9]{64}/(?:0|[1-9][0-9]?)-([a-f0-9]{64})\.part'
+        pattern = r'/_private/' + re.escape(APP) + r'/[A-Za-z0-9_-]{1,128}/(?:archive|package)/[a-f0-9]{64}/(?:0|[1-9][0-9]{0,2})-([a-f0-9]{64})\.part'
         match = re.fullmatch(pattern, relative)
         if (not match or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or
             not 0 < info.st_size <= PART_SIZE):
@@ -182,7 +183,7 @@ def stage_artifact(config, source, release_id, kind, descriptor):
         raise DeliveryError('Invalid immutable artifact identity.')
     parts, digest, total = [], hashlib.sha256(), 0
     with Path(source).open('rb') as stream:
-        while chunk := stream.read(PART_SIZE):
+        while chunk := stream.read(PIECE_SIZE):
             total += len(chunk)
             if total > MAX_ARCHIVE:
                 raise DeliveryError('Archive exceeds the delivery bound.')
@@ -449,17 +450,33 @@ class Cloudflare:
         try:
             self.query('INSERT INTO entitlements(grant_id,app_id,channel) VALUES(?,?,?)', (grant, APP, 'qualification'))
             path = f'/v1/apps/{APP}/releases/{release_id}/{kind}'
-            request = urllib.request.Request(self.config['origin'] + path, headers={
-                'Authorization': 'Bearer ' + token, 'User-Agent': 'MachineMonitor-Delivery/1.0'})
+            headers = {'Authorization': 'Bearer ' + token, 'User-Agent': 'MachineMonitor-Delivery/1.0'}
             digest, size = hashlib.sha256(), 0
+            deadline = time.monotonic() + 300
             try:
+                request = urllib.request.Request(self.config['origin'] + path + '/parts', headers=headers)
                 with self._opener.open(request, timeout=30) as response:
-                    if response.status != 200 or response.headers.get('Content-Length') != str(descriptor['size']):
+                    raw = response.read(131073)
+                    if response.status != 200 or len(raw) > 131072:
                         raise DeliveryError('Private remote readback failed.')
-                    while chunk := response.read(1024 * 1024):
-                        size += len(chunk)
-                        if size > descriptor['size']: raise DeliveryError('Remote readback length exceeded.')
-                        digest.update(chunk)
+                ordered = validate_piece_descriptor(raw, release_id, kind, descriptor)
+                for part in ordered:
+                    if time.monotonic() >= deadline:
+                        raise DeliveryError('Private remote readback deadline exceeded.')
+                    request = urllib.request.Request(self.config['origin'] + path + '/parts/' + str(part['index']), headers=headers)
+                    part_hash, part_size = hashlib.sha256(), 0
+                    with self._opener.open(request, timeout=min(30, deadline - time.monotonic())) as response:
+                        if response.status != 200 or response.headers.get('Content-Length') != str(part['size']):
+                            raise DeliveryError('Private piece readback failed.')
+                        while chunk := response.read(65536):
+                            if time.monotonic() >= deadline:
+                                raise DeliveryError('Private remote readback deadline exceeded.')
+                            part_size += len(chunk)
+                            if part_size > part['size']:
+                                raise DeliveryError('Remote piece length exceeded.')
+                            part_hash.update(chunk); digest.update(chunk); size += len(chunk)
+                    if (part_size, part_hash.hexdigest()) != (part['size'], part['sha256']):
+                        raise DeliveryError('Remote piece hash/length mismatch.')
             except (OSError, urllib.error.URLError):
                 raise DeliveryError('Private remote readback failed; channel was not advanced.') from None
             if (digest.hexdigest(), size) != (descriptor['sha256'], descriptor['size']):
@@ -473,6 +490,41 @@ def source_digest():
     for name in ('worker.mjs', 'contract.mjs', 'web.mjs'):
         digest.update(name.encode()); digest.update((ROOT / 'delivery' / name).read_bytes())
     return digest.hexdigest()
+
+
+def validate_piece_descriptor(raw, release_id, kind, descriptor):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate')
+            result[key] = value
+        return result
+    try:
+        if len(raw) > 131072:
+            raise ValueError('size')
+        value = json.loads(raw, object_pairs_hook=unique)
+        expected = dict(schema='machine-monitor/artifact-parts/v1', app_id=APP,
+                        release_id=release_id, kind=kind, artifact_sha256=descriptor['sha256'],
+                        artifact_size=descriptor['size'], part_size=PIECE_SIZE)
+        if (set(value) != set(expected) | {'parts'} or any(type(value[k]) is not type(v) or value[k] != v for k, v in expected.items()) or
+                not isinstance(value['parts'], list) or not 1 <= len(value['parts']) <= 512 or
+                len(value['parts']) != (descriptor['size'] + PIECE_SIZE - 1) // PIECE_SIZE):
+            raise ValueError('fields')
+        total = 0
+        for index, part in enumerate(value['parts']):
+            if (not isinstance(part, dict) or set(part) != {'index', 'size', 'sha256'} or
+                    type(part['index']) is not int or part['index'] != index or
+                    type(part['size']) is not int or not 1 <= part['size'] <= PIECE_SIZE or
+                    (index < len(value['parts']) - 1 and part['size'] != PIECE_SIZE) or
+                    not isinstance(part['sha256'], str) or not re.fullmatch('[a-f0-9]{64}', part['sha256'])):
+                raise ValueError('part')
+            total += part['size']
+        if total != descriptor['size']:
+            raise ValueError('total')
+        return value['parts']
+    except (ValueError, TypeError, KeyError, UnicodeError):
+        raise DeliveryError('Invalid bound private piece descriptor.') from None
 
 
 def current_version(deployments):
