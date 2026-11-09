@@ -155,9 +155,10 @@ export default {async fetch(request, env, ctx) {
     let body=null;
     if(request.method!=='HEAD') {
       const bytes=await pieceBytes(response,part,request.signal);
-      // EOF, size, cancellation and deadline checks finish before a response is
-      // created. Enqueue the owned validated buffer without a BufferSource copy.
-      body=new ReadableStream({start(controller){controller.enqueue(bytes);controller.close();}});
+      // Validate EOF before creating a response. Workers only preserves the
+      // Content-Length of a stream when its fixed length is known to the runtime.
+      body=new ReadableStream({start(controller){controller.enqueue(bytes);controller.close();}})
+        .pipeThrough(new FixedLengthStream(bytes.byteLength),{signal:request.signal});
     }
     return new Response(body,{headers:{...POLICY,
       'Content-Type':'application/octet-stream','Content-Length':String(part.size),'Accept-Ranges':'none'}});
