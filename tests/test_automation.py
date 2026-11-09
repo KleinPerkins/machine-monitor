@@ -154,6 +154,63 @@ class ExactHeadApproval(unittest.TestCase):
             eligible=lambda pr: policy.eligible(pr, run(), ['app.js'], base_sha='c'*40),
             read_token='fixture-read-token', report=lambda *_: None, controls=self.controls)
 
+    def test_trusted_entrypoint_approves_large_owner_policy_change(self):
+        import contextlib
+        import io
+        import json
+        import os
+        import tempfile
+        from unittest.mock import patch
+
+        repository = dict(full_name=REPO, id=12345, visibility='public', default_branch='main',
+            allow_squash_merge=True, allow_merge_commit=False, allow_rebase_merge=False,
+            allow_auto_merge=True, delete_branch_on_merge=True)
+        rules = [dict(type=name) for name in ('required_linear_history', 'deletion', 'non_fast_forward')]
+        rules += [dict(type='pull_request', parameters=dict(required_approving_review_count=1,
+            dismiss_stale_reviews_on_push=True, required_review_thread_resolution=True)),
+            dict(type='required_status_checks', parameters=dict(strict_required_status_checks_policy=True,
+            required_status_checks=[dict(context='ci-required', integration_id=shared.ACTIONS_APP_ID)]))]
+        event = dict(repository=dict(full_name=REPO, id=12345), workflow_run=run())
+        self.pr['changed_files'] = 3001
+        self.pr['head']['ref'] = 'release-please--owner-policy-change'
+        reads = []
+
+        def request(path, **kwargs):
+            reads.append(path)
+            if path == 'repos/' + REPO:
+                return repository
+            if path.endswith('/rules/branches/main'):
+                return rules
+            if path == f'repos/{REPO}/commits/{HEAD}/pulls?per_page=100':
+                self.assertTrue(kwargs['paginate'])
+                return [[copy.deepcopy(self.pr)]]
+            if path == 'users/' + self.reviewer['login']:
+                return self.reviewer
+            # The fixture refuses unknown requests; no transport can reach GitHub.
+            return self.request(path, **kwargs)
+
+        with tempfile.TemporaryDirectory(prefix='monitor-owner-entrypoint-') as temporary:
+            root = Path(temporary)
+            (root / '.planning').mkdir()
+            (root / '.planning/doc-warden.json').write_text(json.dumps(dict(github_repository_id=12345)))
+            event_path = root / 'event.json'
+            event_path.write_text(json.dumps(event))
+            environment = dict(GITHUB_ACTIONS='true', GITHUB_EVENT_NAME='workflow_run',
+                GITHUB_REPOSITORY=REPO, GITHUB_EVENT_PATH=str(event_path),
+                CI_READ_TOKEN='fixture-read-token', REVIEWER_LOGIN=self.reviewer['login'],
+                GITHUB_STEP_SUMMARY='')
+            with patch.dict(os.environ, environment), patch.object(policy, 'ROOT', root), \
+                 patch.object(policy, 'api', request), \
+                 patch.object(policy, 'enable_merge', lambda number, head: self.merges.append((number, head))), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(policy.main(), 0)
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.writes[0]['event'], 'APPROVE')
+        self.assertEqual(self.writes[0]['commit_id'], HEAD)
+        self.assertEqual(self.merges, [(7, HEAD)])
+        self.assertEqual(reads.count('repos/' + REPO + '/rules/branches/main'), 3)
+        self.assertFalse(any('/compare/' in path for path in reads))
+
     def test_only_verified_current_commit_is_approved_and_armed(self):
         self.execute()
         self.assertEqual(self.writes[0]['commit_id'], HEAD)
