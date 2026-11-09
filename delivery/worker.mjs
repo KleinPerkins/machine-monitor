@@ -14,7 +14,7 @@ const deny = () => reply({error:'access_denied'},401);
 const READ_MS=30000;
 async function timed(operation, cancel=()=>{}) {
   let timer;
-  try {return await Promise.race([operation,new Promise((_,reject)=>{timer=setTimeout(()=>{cancel();reject(new Error('timeout'));},READ_MS);})]);}
+  try {return await Promise.race([operation,new Promise((_,reject)=>{timer=setTimeout(()=>{reject(new Error('timeout'));cancel();},READ_MS);})]);}
   finally {clearTimeout(timer);}
 }
 async function asset(env, approved, part, method, signal) {
@@ -33,32 +33,54 @@ async function asset(env, approved, part, method, signal) {
     return response;
   }finally {signal?.removeEventListener('abort',cancel);}
 }
-async function multipart(env, approved, ordered, signal) {
-  // Fetch headers for the first part before sending success; later failures abort
-  // the response. The unchanged complete-artifact client hash/signature rejects it.
-  let index=0, consumed=0, reader=(await asset(env,approved,ordered[0],'GET',signal)).body?.getReader();
-  if(!reader)throw new Error('asset');
-  return new ReadableStream({
-    async pull(controller) {
-      try {
-        while(true) {
-          if(signal?.aborted)throw new Error('cancelled');
-          const item=await timed(reader.read(),()=>{reader.cancel().catch(()=>{});});
-          if(item.done) {
-            if(consumed!==ordered[index].size)throw new Error('length');
-            reader.releaseLock();reader=null;index++;consumed=0;
-            if(index===ordered.length){controller.close();return;}
-            reader=(await asset(env,approved,ordered[index],'GET',signal)).body?.getReader();
-            if(!reader)throw new Error('asset');
-            continue;
-          }
-          if(!item.value?.byteLength || consumed+item.value.byteLength>ordered[index].size)throw new Error('length');
-          consumed+=item.value.byteLength;controller.enqueue(item.value);return;
+async function multipart(env, approved, ordered, signal, ctx) {
+  const first=await asset(env,approved,ordered[0],'GET',signal);
+  if(!first.body)throw new Error('asset');
+  const output=new FixedLengthStream(ordered.reduce((size,part)=>size+part.size,0));
+  const writer=output.writable.getWriter();
+  let reader=null,cancelled=false,buffer;
+  const cancel=()=>{cancelled=true;reader?.cancel().catch(()=>{});};
+  const abort=()=>{cancel();writer.abort(new Error('cancelled')).catch(()=>{});};
+  signal?.addEventListener('abort',abort,{once:true});writer.closed.catch(cancel);
+  const task=(async()=>{
+    for(let index=0;index<ordered.length;index++) {
+      const response=index===0?first:await asset(env,approved,ordered[index],'GET',signal);
+      if(!response.body)throw new Error('asset');
+      let byob=false;
+      try {reader=response.body.getReader({mode:'byob'});byob=true;}catch {reader=response.body.getReader();}
+      const native=byob&&typeof reader.readAtLeast==='function';let consumed=0;
+      while(consumed<ordered[index].size) {
+        if(cancelled||signal?.aborted)throw new Error('cancelled');
+        let operation;
+        if(native) {buffer??=new Uint8Array(4*1024*1024);operation=reader.readAtLeast(Math.min(buffer.length,ordered[index].size-consumed),buffer);}
+        else if(byob) {const bytes=new Uint8Array(4*1024*1024);operation=reader.read(bytes,{min:Math.min(bytes.length,ordered[index].size-consumed)});}
+        else operation=reader.read();
+        const item=await timed(operation,cancel);
+        if(cancelled||!item.value?.byteLength||consumed+item.value.byteLength>ordered[index].size)throw new Error('length');
+        consumed+=item.value.byteLength;
+        if(item.done&&consumed!==ordered[index].size)throw new Error('length');
+        if(consumed===ordered[index].size&&!item.done) {
+          // Check EOF before publishing this part's last bytes. Extra data must
+          // never appear to be a valid complete response merely by its prefix.
+          const end=await timed(native?reader.readAtLeast(1,new Uint8Array(1)):byob?reader.read(new Uint8Array(1),{min:1}):reader.read(),cancel);
+          if(cancelled||signal?.aborted||!end.done||end.value?.byteLength)throw new Error('length');
         }
-      } catch {if(reader){await reader.cancel().catch(()=>{});reader.releaseLock();reader=null;}controller.error(new Error('incomplete artifact'));}
-    },
-    async cancel(){if(reader){await reader.cancel().catch(()=>{});reader.releaseLock();reader=null;}}
-  },{highWaterMark:0});
+        if(cancelled||signal?.aborted)throw new Error('cancelled');
+        await timed(writer.write(item.value),abort);
+        // Workerd identity writes copy their bytes and settle on consumption.
+        // Reuse only on its native BYOB path; generic streams get fresh buffers.
+        if(native)buffer=new Uint8Array(item.value.buffer);
+      }
+      reader.releaseLock();reader=null;
+    }
+    await writer.close();
+  })().catch(async()=>{await writer.abort(new Error('incomplete artifact')).catch(()=>{});}).finally(async()=>{
+    signal?.removeEventListener('abort',abort);
+    if(reader){await reader.cancel().catch(()=>{});reader.releaseLock();reader=null;}
+    writer.releaseLock();
+  });
+  ctx?.waitUntil(task);
+  return output.readable;
 }
 const auth = `FROM grants g JOIN entitlements e ON e.grant_id=g.grant_id
  WHERE g.token_hash=? AND e.app_id=? AND e.channel=? AND g.revoked_at IS NULL
@@ -77,7 +99,7 @@ async function smallJSON(request) {
   const bytes=new Uint8Array(size);let offset=0;for(const c of chunks){bytes.set(c,offset);offset+=c.length;}
   return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
 }
-export default {async fetch(request, env) {
+export default {async fetch(request, env, ctx) {
   try {
     const approved=origin(env.UPDATE_ORIGIN), url=new URL(request.url);
     if(url.origin!==approved || url.search || url.username || url.password) return reply({error:'invalid_request'},400);
@@ -130,14 +152,7 @@ export default {async fetch(request, env) {
     let body=null;
     if(request.method==='HEAD') {
       for(const part of ordered)await asset(env,approved,part,'HEAD',request.signal);
-    } else {
-      const source=await multipart(env,approved,ordered,request.signal);
-      // Workers ignores a manually declared length for an ordinary stream. This
-      // preserves bounded streaming and emits the length required by our clients.
-      const fixed=new FixedLengthStream(artifact.size);
-      source.pipeTo(fixed.writable).catch(()=>{}); // pipe failures abort readable
-      body=fixed.readable;
-    }
+    } else body=await multipart(env,approved,ordered,request.signal,ctx);
     return new Response(body,{headers:{...POLICY,
       'Content-Type':'application/zip','Content-Length':String(artifact.size),
       'Content-Disposition':'attachment; filename="Machine-Monitor.zip"','Accept-Ranges':'none'}});
