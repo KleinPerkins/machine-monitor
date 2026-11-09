@@ -154,6 +154,12 @@ for requests rejected when a library-default identifier is used.
   qualification grant reads the descriptor and every authenticated piece back;
   exact hash/length verification precedes channel advancement. A readback failure
   may retain an immutable qualification row but never advances its channel.
+  New stored part rows use compact JSON. The Worker validates their closed,
+  scalar-only shape before requiring a lossless native JSON round trip; duplicate
+  keys, escaped aliases and noncanonical encodings fail before any asset read.
+  External wire JSON keeps its existing duplicate-key parser. Piece requests
+  validate the complete bounded layout without constructing the descriptor
+  response used by `/parts`; authorization and EOF checks are unchanged.
 - Stable publication uses the same command with stable/qualified manifest and no
   archive/package inputs. The existing qualification manifest must match exactly
   except channel/qualified. Both retained artifacts are read back again; stable
