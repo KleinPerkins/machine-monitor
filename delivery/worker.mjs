@@ -1,4 +1,4 @@
-import {APP, TOKEN, ID, origin, manifest, sha256, parts, PIECE_SIZE, pieceDescriptor, parseWireJSON} from './contract.mjs';
+import {APP, TOKEN, ID, origin, manifest, sha256, parts, PIECE_SIZE, pieceDescriptor} from './contract.mjs';
 import {PAGE, CLIENT} from './web.mjs';
 const POLICY = {
   'Cache-Control':'private, no-store, max-age=0', 'CDN-Cache-Control':'no-store',
@@ -130,17 +130,25 @@ export default {async fetch(request, env, ctx) {
     if(m)return reply(release);
     const artifact=a[3]==='package'?release.first_install:release.archive;
     if(typeof row.parts_json!=='string'||row.parts_json.length>524288)throw new Error('parts');
-    const ordered=parts(parseWireJSON(row.parts_json),APP,row.release_id,a[3],artifact);
+    const ordered=parts(JSON.parse(row.parts_json),APP,row.release_id,a[3],artifact);
+    // Owner publication stores compact JSON with scalar-only, closed part rows.
+    // After validating that flat shape, native round-trip equality rejects
+    // duplicate/escaped keys and other noncanonical encodings without a second
+    // character-by-character parser and its per-string allocations.
+    if(JSON.stringify(ordered)!==row.parts_json)throw new Error('parts');
     // Conditional/range requests authorize first; never return a cached 304.
     if(request.headers.has('Range'))return reply({error:'ranges_unsupported'},416,{'Accept-Ranges':'none'});
     if([...request.headers.keys()].some(k=>k.startsWith('if-')))return reply({error:'conditions_unsupported'},400);
     // Legacy aggregate locators are identities only; old owner-only builds must
     // not retain an unqualified expensive concatenation path.
     if(!a[4])throw new Error('aggregate unavailable');
-    const descriptor=pieceDescriptor({schema:'machine-monitor/artifact-parts/v1',app_id:APP,release_id:a[2],kind:a[3],
+    // Retention also understands legacy20MiB rows; every current route,
+    // including HEAD, requires the bounded1MiB layout before reading any asset.
+    if(ordered.length!==Math.ceil(artifact.size/PIECE_SIZE)||
+       ordered.some((p,i)=>p.size>PIECE_SIZE||(i<ordered.length-1&&p.size!==PIECE_SIZE)))throw new Error('pieces');
+    if(a[5]===undefined)return reply(pieceDescriptor({schema:'machine-monitor/artifact-parts/v1',app_id:APP,release_id:a[2],kind:a[3],
       artifact_sha256:artifact.sha256,artifact_size:artifact.size,part_size:PIECE_SIZE,
-      parts:ordered.map(({index,size,sha256})=>({index,size,sha256}))},artifact);
-    if(a[5]===undefined)return reply(descriptor);
+      parts:ordered.map(({index,size,sha256})=>({index,size,sha256}))},artifact));
     const part=ordered[Number(a[5])];
     if(!part)return reply({error:'invalid_piece'},400);
     const response=await asset(env,approved,part,request.method,request.signal);

@@ -54,7 +54,7 @@ export function parts(value,app,release,kind,descriptor) {
   value.forEach((part,index)=>{
     if(!part || Object.keys(part).sort().join(',')!=='index,path,sha256,size' || part.index!==index ||
       !Number.isSafeInteger(part.size)||part.size<1||part.size>PART_SIZE ||
-      (index<value.length-1&&part.size!==stride) || !/^[a-f0-9]{64}$/.test(part.sha256) ||
+      (index<value.length-1&&part.size!==stride) || typeof part.sha256!=='string' || !/^[a-f0-9]{64}$/.test(part.sha256) ||
       part.path!==`/_private/${app}/${release}/${kind}/${descriptor.sha256}/${index}-${part.sha256}.part`)throw new Error('parts');
     total+=part.size;
   });

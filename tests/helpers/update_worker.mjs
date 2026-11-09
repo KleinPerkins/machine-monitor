@@ -60,6 +60,17 @@ async function run(){
   f.db.prepare('INSERT INTO releases VALUES(?,?,?,?,?,?,?,?,?)').run(APP,'multipart-8','stable',JSON.stringify(mr),mr.archive.sha256,mr.archive.size,`${APP}/${mr.archive.sha256}.zip`,mr.qualification_id,'{}');
   const path=`/v1/apps/${APP}/releases/multipart-8/archive`;assert.equal(hash(await download(path,f.friend)),hash(multi));assertions++;
   const table=pieceDescriptor(await(await expect(path+'/parts',f.friend,200)).json(),mr.archive);
+  const stored=JSON.stringify(mp),database=f.env.DB;let storedOverride=null;
+  // Inject a corrupt D1 result without disabling the real immutable-row trigger.
+  f.env.DB={withSession(mode){const session=database.withSession(mode);return{prepare(sql){const statement=session.prepare(sql);return{bind(...params){const bound=statement.bind(...params);return{async first(){const row=await bound.first();return row?.release_id==='multipart-8'&&storedOverride!==null?{...row,parts_json:storedOverride}:row;}};}};}};}};
+  // Publication uses compact scalar JSON. Reject duplicates, escaped aliases,
+  // noncanonical encodings and nested values before any private asset read.
+  for(const bad of [stored.replace('"index":0','"index":0,"index":0'),stored.replace('"index":0','"index":0,"\\u0069ndex":0'),
+      ' '+stored,stored.replace('"index":0','"index":0.0'),stored.replace('"path"','"\\u0070ath"'),
+      JSON.stringify(mp.map(p=>({...p,sha256:[p.sha256]}))),JSON.stringify(mp.map(p=>({...p,sha256:{nested:p.sha256}})))]){
+   storedOverride=bad;const before=f.assetReads;await expect(path+'/parts/0',f.friend,503);await expect(path+'/parts/0',f.friend,503,{method:'HEAD'});await expect(path+'/parts',f.friend,503);assert.equal(f.assetReads,before);assertions++;
+  }
+  storedOverride=stored;await expect(path+'/parts/0',f.friend,200);await expect(path+'/parts/0',f.friend,200,{method:'HEAD'});f.env.DB=database;
   for(const change of [{extra:true},{part_size:20*PART_SIZE},{artifact_size:true},{artifact_sha256:'b'.repeat(64)},{kind:'package'},{release_id:'other'},{parts:[...table.parts].reverse()},{parts:[table.parts[0],table.parts[0]]},{parts:[]},{parts:table.parts.map(p=>({...p,index:true}))},{parts:table.parts.map(p=>({...p,size:p.size+1}))},{parts:table.parts.map(p=>({...p,url:'https://attacker.invalid'}))}]){assert.throws(()=>pieceDescriptor({...table,...change},mr.archive));assertions++;}
   for(const text of ['{"a":1,"a":2}','{"a":1,"\\u0061":2}','{"x":[{"b":1,"b":2}]}']){assert.throws(()=>parseWireJSON(text));assertions++;}assert.deepEqual(parseWireJSON('{"ok":[1,{"b":true}]}'),{ok:[1,{b:true}]});
   for(const bad of [[...mp].reverse(),[mp[0],mp[0]],mp.map((p,i)=>({...p,index:i+1})),mp.map(p=>({...p,path:p.path.replace('/archive/','/package/')}))]){assert.throws(()=>parts(bad,APP,'multipart-8','archive',mr.archive));assertions++;}
@@ -82,6 +93,7 @@ async function run(){
   f.env.ASSETS=real;
   // Legacy immutable20MiB metadata remains valid for retention, but not new delivery.
   const legacy=f.makeRelease('stable','legacy-9');legacy.archive.size=20*PART_SIZE+1;legacy.archive.sha256='b'.repeat(64);const lp=[20*PART_SIZE,1].map((size,index)=>({index,size,sha256:'c'.repeat(64),path:`/_private/${APP}/legacy-9/archive/${legacy.archive.sha256}/${index}-${'c'.repeat(64)}.part`}));parts(lp,APP,'legacy-9','archive',legacy.archive);f.db.prepare('INSERT INTO artifact_parts VALUES(?,?,?,?,?)').run(APP,'legacy-9','archive',legacy.archive.sha256,JSON.stringify(lp));f.db.prepare('INSERT INTO releases VALUES(?,?,?,?,?,?,?,?,?)').run(APP,'legacy-9','stable',JSON.stringify(legacy),legacy.archive.sha256,legacy.archive.size,`${APP}/${legacy.archive.sha256}.zip`,legacy.qualification_id,'{}');const n=f.assetReads;await expect(`/v1/apps/${APP}/releases/legacy-9/archive/parts`,f.friend,503);assert.equal(f.assetReads,n);
+  const legacyAssets=f.assetReads;await expect(`/v1/apps/${APP}/releases/legacy-9/archive/parts/0`,f.friend,503);await expect(`/v1/apps/${APP}/releases/legacy-9/archive/parts/0`,f.friend,503,{method:'HEAD'});assert.equal(f.assetReads,legacyAssets);
   console.log(JSON.stringify({passed:true,assertions,primary_reads:f.primaryReads,asset_reads:f.assetReads}));
  }finally{f.close();}
 }
