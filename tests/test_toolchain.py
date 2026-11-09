@@ -9,6 +9,7 @@ import tarfile
 import tempfile
 import unittest
 import ssl
+import sys
 import urllib.error
 from unittest.mock import call, patch
 
@@ -131,6 +132,53 @@ class DownloadConsumerTests(unittest.TestCase):
             self.assertEqual(open_url.call_count, 2)
             sleep.assert_called_once_with(1)
         self.assertFalse(result.exists())
+
+
+class PinnedSparkleArchiveTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='monitor-local-sparkle-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.payload = DownloadConsumerTests.archive({'Sparkle.framework/Sparkle': b'fixture-framework',
+            'bin/sign_update': b'fixture-signer', 'LICENSE': b'fixture-license'}, 'w:xz')
+        self.archive = self.root / 'official.tar.xz'
+        self.archive.write_bytes(self.payload)
+        pin = patch.object(sparkle, 'SHA256', hashlib.sha256(self.payload).hexdigest())
+        pin.start(); self.addCleanup(pin.stop)
+
+    def test_official_local_bytes_seed_cache_without_network_and_are_revalidated(self):
+        with patch.object(sparkle, 'download_bytes', side_effect=AssertionError('Unexpected network')):
+            target = sparkle.distribution(self.root / 'cache', archive=self.archive)
+            self.assertEqual((target / 'Sparkle.framework/Sparkle').read_bytes(), b'fixture-framework')
+            self.assertEqual(sparkle.distribution(self.root / 'cache'), target)
+            (target / 'bin/sign_update').write_bytes(b'changed')
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                sparkle.distribution(self.root / 'cache', archive=self.archive)
+
+    def test_corrupt_archive_is_rejected_before_extraction_even_with_valid_cache(self):
+        target = sparkle.distribution(self.root / 'cache', archive=self.archive)
+        self.archive.write_bytes(b'wrong bytes')
+        with patch.object(sparkle.tarfile, 'open', side_effect=AssertionError('Unverified extraction')):
+            with self.assertRaisesRegex(ValueError, 'checksum'):
+                sparkle.distribution(self.root / 'empty', archive=self.archive)
+            with self.assertRaisesRegex(ValueError, 'checksum'):
+                sparkle.distribution(self.root / 'cache', archive=self.archive)
+        self.assertTrue(target.is_dir())
+
+    def test_symlink_relative_directory_and_oversized_inputs_are_refused(self):
+        link = self.root / 'link'; link.symlink_to(self.archive)
+        large = self.root / 'large'; large.touch()
+        with large.open('r+b') as stream: stream.truncate(40 * 1024**2 + 1)
+        for path in (link, Path('relative.tar.xz'), self.root, large):
+            with self.subTest(path=path.name), self.assertRaises((ValueError, OSError)):
+                sparkle.pinned_archive(path)
+
+    def test_fifo_input_is_refused_without_waiting_for_a_writer(self):
+        fifo = self.root / 'fifo'; os.mkfifo(fifo)
+        code = 'from scripts.sparkle import pinned_archive; import sys\ntry:pinned_archive(sys.argv[1])\nexcept ValueError:sys.exit(0)\nsys.exit(3)'
+        result = subprocess.run([sys.executable, '-c', code, str(fifo)], cwd=Path(__file__).resolve().parents[1],
+                                capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
 
 
 class PinnedNodeTests(unittest.TestCase):

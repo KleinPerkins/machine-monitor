@@ -219,6 +219,13 @@ python scripts/release.py --source-revision MERGED_MAIN_SHA \
 ```
 
 The settings file contains only `origin`, `channel` and `public_ed25519_key`.
+When the upstream download is unavailable, `--sparkle-archive /private/Sparkle-2.10.1.tar.xz`
+accepts the official archive obtained separately. It requires an owned bounded
+canonical regular file and verifies the same pinned SHA256 before extraction,
+even if a cache already exists. Only ignored build output in the fresh checkout
+is seeded; the builder revalidates the complete cache. Source parity, signing,
+notarization, Gatekeeper and archive-signature gates still run normally. The input
+choice is recorded in private provenance without recording the local path.
 Signing identity, notary profile and Sparkle account are references to existing
 owner-managed secure material. The tool never exports keys. It builds an isolated
 checkout, signs inside-out, requires accepted notarization and validated stapling,

@@ -343,14 +343,25 @@ class ArtifactTests(unittest.TestCase):
                                       'public_ed25519_key': PUBLIC}))
         options = argparse.Namespace(source_revision=SHA, version='1.1.0', build_number=2,
             release_id='release2', qualification_id='q2', signing_identity='a' * 40,
-            notary_profile='fixture-profile', sparkle_account=r.APP, output=self.root, update_config=config)
+            notary_profile='fixture-profile', sparkle_account=r.APP, output=self.root, update_config=config,
+            sparkle_archive=self.root / 'official-sparkle.tar.xz')
+        sequence = []
         status = ['Invalid']
         uploaded = []
         def fetch(sha, target, run):
+            sequence.append('fetch')
             target.mkdir()
+        def upstream(cache=None, *, archive=None):
+            sequence.append('seed' if archive is not None else 'verify-cache')
+            if archive is not None:
+                self.assertEqual(archive, options.sparkle_archive)
+                self.assertEqual(sequence[-2], 'verify-source')
+            return self.root / 'upstream'
         def run(args, **kwargs):
             args = list(map(str, args))
             if len(args) > 1 and args[1].endswith('build_mac_app.py'):
+                self.assertEqual(sequence[-1], 'seed')
+                sequence.append('build')
                 source = Path(args[1]).parent
                 settings = json.loads(Path(args[-1]).read_text())
                 for name in ('Machine Monitor.app', 'Machine Monitor Recovery.app'):
@@ -379,12 +390,12 @@ class ArtifactTests(unittest.TestCase):
             return b''
         with ExitStack() as stack:
             stack.enter_context(patch.object(r, 'fetch_source', fetch))
-            stack.enter_context(patch.object(r, 'verify_launcher'))
+            stack.enter_context(patch.object(r, 'verify_launcher', side_effect=lambda source: sequence.append('verify-source')))
             stack.enter_context(patch.object(r, 'dependencies', return_value={'fixture': '1'}))
             stack.enter_context(patch.object(r, 'signature', return_value=SIGNATURE))
             stack.enter_context(patch.object(r.platform, 'system', return_value='Darwin'))
             stack.enter_context(patch.object(r.platform, 'machine', return_value='arm64'))
-            stack.enter_context(patch('scripts.sparkle.distribution', return_value=self.root / 'upstream'))
+            stack.enter_context(patch('scripts.sparkle.distribution', side_effect=upstream))
             stack.enter_context(patch('scripts.toolchain.node', return_value=Path('/synthetic/node')))
             stack.enter_context(patch('update_preflight.extract_archive', side_effect=lambda a,d,m:
                 extract_archive(a,d,m,verifier=lambda app, expected: {'synthetic': True})))
@@ -406,6 +417,7 @@ class ArtifactTests(unittest.TestCase):
         provenance = json.loads((final / 'provenance.json').read_text())
         self.assertEqual(provenance['runtime_channel'], 'stable')
         self.assertEqual(provenance['distribution_channel'], 'qualification')
+        self.assertEqual(provenance['sparkle_archive_input'], 'locally-supplied-pinned-archive')
         self.assertFalse(manifest['qualified'])
         self.assertNotIn('private_upgrade', receipt['checks'])
         self.assertEqual(receipt['archive_sha256'], manifest['archive']['sha256'])

@@ -500,6 +500,11 @@ def prepare(options, *, run=command, api=github):
         verify_launcher(source)
         settings = public_settings(options.update_config)
         pins = dependencies(source)
+        local_archive = getattr(options, 'sparkle_archive', None)
+        if local_archive is not None:
+            # Seed only ignored generated build output after clean-source and
+            # helper-parity checks. The builder revalidates this complete cache.
+            distribution(source / 'build/toolchains', archive=local_archive)
         public = scratch / 'update-config.json'
         write_json(public, {'origin': settings['MachineMonitorUpdateOrigin'],
                            'channel': settings['MachineMonitorUpdateChannel'],
@@ -551,6 +556,7 @@ def prepare(options, *, run=command, api=github):
         write_json(results / 'qualification.json', receipt)
         write_json(results / 'provenance.json', {'source': latest, 'dependencies': pins,
                    'python': platform.python_version(), 'sparkle': '2.10.1', 'notary_submission_id': notary_id,
+                   'sparkle_archive_input': 'locally-supplied-pinned-archive' if local_archive is not None else 'official-download-or-verified-cache',
                    'runtime_channel': settings['MachineMonitorUpdateChannel'], 'distribution_channel': 'qualification'})
         results.rename(final)
     return final
@@ -567,6 +573,7 @@ def main(argv=None):
     parser.add_argument('--signing-identity', required=True, help='Selected Developer ID certificate SHA')
     parser.add_argument('--notary-profile', required=True, help='Opaque existing notarytool Keychain profile')
     parser.add_argument('--sparkle-account', required=True, help='Existing app-specific Sparkle Keychain account')
+    parser.add_argument('--sparkle-archive', type=Path, help='Optional absolute canonical official Sparkle archive; the pinned SHA256 is mandatory')
     parser.add_argument('--output', required=True, type=Path, help='Existing private mode-0700 directory outside Git')
     try:
         output = prepare(parser.parse_args(argv))
