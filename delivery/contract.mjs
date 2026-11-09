@@ -45,16 +45,19 @@ export async function sha256(bytes) {
 
 // Immutable publication-only metadata. Full archive hashes/signatures stay on wire.
 export const PART_SIZE=20*1024*1024;
-export const PIECE_SIZE=1024*1024;
+export const PIECE_SIZE=256*1024;
+export const MAX_PIECES=2048;
+export const WIRE_LIMIT=256*1024;
+export const INTERNAL_LIMIT=1024*1024;
 export function parts(value,app,release,kind,descriptor) {
-  if(!Array.isArray(value)||value.length<1||value.length>512)throw new Error('parts');
+  if(!Array.isArray(value)||value.length<1||value.length>MAX_PIECES)throw new Error('parts');
   const stride=value[0]?.size;
-  if(value.length>1&&![PART_SIZE,PIECE_SIZE].includes(stride))throw new Error('parts');
+  if(value.length>1&&![PART_SIZE,1024*1024,PIECE_SIZE].includes(stride))throw new Error('parts');
   let total=0;
   value.forEach((part,index)=>{
     if(!part || Object.keys(part).sort().join(',')!=='index,path,sha256,size' || part.index!==index ||
       !Number.isSafeInteger(part.size)||part.size<1||part.size>PART_SIZE ||
-      (index<value.length-1&&part.size!==stride) || typeof part.sha256!=='string' || !/^[a-f0-9]{64}$/.test(part.sha256) ||
+      (index<value.length-1&&part.size!==stride) || part.size>stride || typeof part.sha256!=='string' || !/^[a-f0-9]{64}$/.test(part.sha256) ||
       part.path!==`/_private/${app}/${release}/${kind}/${descriptor.sha256}/${index}-${part.sha256}.part`)throw new Error('parts');
     total+=part.size;
   });
@@ -66,9 +69,9 @@ export function pieceDescriptor(value,descriptor) {
   const kind=descriptor.path.split('/').at(-1),release=descriptor.path.split('/').at(-2);
   validateDescriptor(descriptor,APP,release,kind);
   if(!['archive','package'].includes(kind)||!value||Object.keys(value).sort().join(',')!=='app_id,artifact_sha256,artifact_size,kind,part_size,parts,release_id,schema'||
-     value.schema!=='machine-monitor/artifact-parts/v1'||value.app_id!==APP||value.release_id!==release||value.kind!==kind||
+     value.schema!=='machine-monitor/artifact-parts/v2'||value.app_id!==APP||value.release_id!==release||value.kind!==kind||
      value.artifact_sha256!==descriptor.sha256||value.artifact_size!==descriptor.size||value.part_size!==PIECE_SIZE||
-     !Array.isArray(value.parts)||value.parts.length!==Math.ceil(descriptor.size/PIECE_SIZE)||value.parts.length>512)throw new Error('pieces');
+     !Array.isArray(value.parts)||value.parts.length!==Math.ceil(descriptor.size/PIECE_SIZE)||value.parts.length>MAX_PIECES)throw new Error('pieces');
   let total=0;
   value.parts.forEach((p,i)=>{
     if(!p||Object.keys(p).sort().join(',')!=='index,sha256,size'||!Number.isSafeInteger(p.index)||p.index!==i||

@@ -5,7 +5,7 @@ import {readFileSync} from 'node:fs';
 import {randomBytes,createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import worker from '../../delivery/worker.mjs';
-import {APP,manifest,PIECE_SIZE as PART_SIZE,parts,pieceDescriptor,parseWireJSON} from '../../delivery/contract.mjs';
+import {APP,manifest,PIECE_SIZE as PART_SIZE,MAX_PIECES,WIRE_LIMIT,INTERNAL_LIMIT,parts,pieceDescriptor,parseWireJSON} from '../../delivery/contract.mjs';
 // Model the Workers length contract in Node: arbitrary streams lose a supplied
 // Content-Length, while FixedLengthStream advertises and enforces its byte count.
 const fixedLengths=new WeakMap();
@@ -21,7 +21,7 @@ export function fixture(origin='https://download.example.invalid') {
     archive:{path:`/v1/apps/${APP}/releases/${release}/archive`,size:archive.length,sha256:hash(archive),ed25519_signature:Buffer.alloc(64).toString('base64')},
     first_install:{path:`/v1/apps/${APP}/releases/${release}/package`,size:first.length,sha256:hash(first),ed25519_signature:Buffer.alloc(64).toString('base64')}});
   const objects=new Map();
-  const partRows=(value,kind,bytes)=>{const release=value.archive.path.split('/').at(-2),desc=kind==='archive'?value.archive:value.first_install;const ordered=[];for(let offset=0;offset<bytes.length;offset+=PART_SIZE){const chunk=bytes.subarray(offset,offset+PART_SIZE),index=ordered.length,digest=hash(chunk),path=`/_private/${APP}/${release}/${kind}/${desc.sha256}/${index}-${digest}.part`;objects.set(path,chunk);ordered.push({index,path,size:chunk.length,sha256:digest});}db.prepare('INSERT OR IGNORE INTO artifact_parts VALUES(?,?,?,?,?)').run(APP,release,kind,desc.sha256,JSON.stringify(ordered));return ordered;};
+  const partRows=(value,kind,bytes)=>{const release=value.archive.path.split('/').at(-2),desc=kind==='archive'?value.archive:value.first_install;const ordered=[];for(let offset=0;offset<bytes.length;offset+=PART_SIZE){const chunk=bytes.subarray(offset,offset+PART_SIZE),index=ordered.length,digest=hash(chunk),path=`/_private/${APP}/${release}/${kind}/${desc.sha256}/${index}-${digest}.part`;objects.set(path,chunk);ordered.push({index,path,size:chunk.length,sha256:digest});}db.prepare('INSERT OR IGNORE INTO artifact_parts VALUES(?,?,?,?,?)').run(APP,release,kind,desc.sha256,JSON.stringify(ordered));db.prepare('INSERT OR IGNORE INTO artifact_protocols VALUES(?,?,?,?,?,?)').run(APP,release,kind,desc.sha256,'machine-monitor/artifact-parts/v2',PART_SIZE);return ordered;};
   const put=(value)=>{partRows(value,'archive',archive);partRows(value,'package',first);const r=value.archive.path.split('/').at(-2);db.prepare('INSERT INTO releases VALUES(?,?,?,?,?,?,?,?,?)').run(APP,r,value.channel,JSON.stringify(value),value.archive.sha256,value.archive.size,`${APP}/${value.archive.sha256}.zip`,value.qualification_id,'{}');db.prepare('INSERT OR REPLACE INTO channels VALUES(?,?,?)').run(APP,value.channel,r);};
   put(makeRelease('stable'));put(makeRelease('qualification','owner-3'));
   const addGrant=(name,owner=false,channel='stable',expiry=Math.floor(Date.now()/1000)+3600)=>{
@@ -124,9 +124,32 @@ async function run(){
    assertions++;
   }
   f.env.ASSETS=real;
-  // Legacy immutable20MiB metadata remains valid for retention, but not new delivery.
-  const legacy=f.makeRelease('stable','legacy-9');legacy.archive.size=20*PART_SIZE+1;legacy.archive.sha256='b'.repeat(64);const lp=[20*PART_SIZE,1].map((size,index)=>({index,size,sha256:'c'.repeat(64),path:`/_private/${APP}/legacy-9/archive/${legacy.archive.sha256}/${index}-${'c'.repeat(64)}.part`}));parts(lp,APP,'legacy-9','archive',legacy.archive);f.db.prepare('INSERT INTO artifact_parts VALUES(?,?,?,?,?)').run(APP,'legacy-9','archive',legacy.archive.sha256,JSON.stringify(lp));f.db.prepare('INSERT INTO releases VALUES(?,?,?,?,?,?,?,?,?)').run(APP,'legacy-9','stable',JSON.stringify(legacy),legacy.archive.sha256,legacy.archive.size,`${APP}/${legacy.archive.sha256}.zip`,legacy.qualification_id,'{}');const n=f.assetReads;await expect(`/v1/apps/${APP}/releases/legacy-9/archive/parts`,f.friend,503);assert.equal(f.assetReads,n);
-  const legacyAssets=f.assetReads;await expect(`/v1/apps/${APP}/releases/legacy-9/archive/parts/0`,f.friend,503);await expect(`/v1/apps/${APP}/releases/legacy-9/archive/parts/0`,f.friend,503,{method:'HEAD'});assert.equal(f.assetReads,legacyAssets);
+  // Legacy metadata, including a one-piece artifact smaller than the new bound,
+  // cannot acquire descriptor-v2 delivery implicitly.
+  for(const stride of [20*1024*1024,1024*1024,3]){
+   const id='legacy-'+stride,legacy=f.makeRelease('stable',id);legacy.archive.size=stride+1;legacy.archive.sha256='b'.repeat(64);
+   const sizes=stride===3?[4]:[stride,1],lp=sizes.map((size,index)=>({index,size,sha256:'c'.repeat(64),path:`/_private/${APP}/${id}/archive/${legacy.archive.sha256}/${index}-${'c'.repeat(64)}.part`}));
+   parts(lp,APP,id,'archive',legacy.archive);f.db.prepare('INSERT INTO artifact_parts VALUES(?,?,?,?,?)').run(APP,id,'archive',legacy.archive.sha256,JSON.stringify(lp));
+   f.db.prepare('INSERT INTO releases VALUES(?,?,?,?,?,?,?,?,?)').run(APP,id,'stable',JSON.stringify(legacy),legacy.archive.sha256,legacy.archive.size,`${APP}/${legacy.archive.sha256}.zip`,legacy.qualification_id,'{}');
+   const before=f.assetReads;for(const suffix of ['/parts','/parts/0']){await expect(`/v1/apps/${APP}/releases/${id}/archive`+suffix,f.friend,503);await expect(`/v1/apps/${APP}/releases/${id}/archive`+suffix,f.revoked,401);}await expect(`/v1/apps/${APP}/releases/${id}/archive/parts/0`,f.friend,503,{method:'HEAD'});assert.equal(f.assetReads,before);
+  }
+  // Maximum metadata and four-digit canonical index with only a one-byte asset.
+  const id='x'.repeat(128),maximum=f.makeRelease('stable',id),last=Buffer.from('x');
+  maximum.archive.size=(MAX_PIECES-1)*PART_SIZE+1;maximum.archive.sha256='a'.repeat(64);
+  const maxRows=Array.from({length:MAX_PIECES},(_,index)=>({index,size:index===MAX_PIECES-1?1:PART_SIZE,sha256:hash(last),path:`/_private/${APP}/${id}/archive/${maximum.archive.sha256}/${index}-${hash(last)}.part`}));
+  const maxJSON=JSON.stringify(maxRows);assert.ok(maxJSON.length<INTERNAL_LIMIT);parts(maxRows,APP,id,'archive',maximum.archive);
+  f.db.prepare('INSERT INTO artifact_parts VALUES(?,?,?,?,?)').run(APP,id,'archive',maximum.archive.sha256,maxJSON);
+  f.db.prepare('INSERT INTO artifact_protocols VALUES(?,?,?,?,?,?)').run(APP,id,'archive',maximum.archive.sha256,'machine-monitor/artifact-parts/v2',PART_SIZE);
+  f.db.prepare('INSERT INTO releases VALUES(?,?,?,?,?,?,?,?,?)').run(APP,id,'stable',JSON.stringify(maximum),maximum.archive.sha256,maximum.archive.size,`${APP}/${maximum.archive.sha256}.zip`,maximum.qualification_id,'{}');
+  f.objects.set(maxRows.at(-1).path,last);
+  const maxPath=`/v1/apps/${APP}/releases/${id}/archive`,meta=await(await expect(maxPath+'/parts',f.friend,200)).text();assert.ok(Buffer.byteLength(meta)<WIRE_LIMIT);assert.equal(pieceDescriptor(parseWireJSON(meta),maximum.archive).parts.length,2048);
+  assert.equal(await(await expect(maxPath+'/parts/2047',f.friend,200)).text(),'x');
+  const lastHead=await expect(maxPath+'/parts/2047',f.friend,200,{method:'HEAD'});assert.equal(lastHead.headers.get('Content-Length'),'1');
+  for(const suffix of ['2048','9999']){await expect(maxPath+'/parts/'+suffix,f.friend,400);await expect(maxPath+'/parts/'+suffix,f.revoked,401);}
+  for(const suffix of ['02047','-1','1.0','2047/extra'])await expect(maxPath+'/parts/'+suffix,f.friend,404);
+  const maxTable=JSON.parse(meta);
+  for(const change of [{schema:'machine-monitor/artifact-parts/v1'},{part_size:1024*1024},{parts:[...maxTable.parts,maxTable.parts[0]]}]){assert.throws(()=>pieceDescriptor({...maxTable,...change},maximum.archive));assertions++;}
+  for(const sql of ["UPDATE artifact_protocols SET part_size=262144","DELETE FROM artifact_protocols"]){assert.throws(()=>f.db.prepare(sql).run());assertions++;}
   console.log(JSON.stringify({passed:true,assertions,primary_reads:f.primaryReads,asset_reads:f.assetReads}));
  }finally{f.close();}
 }

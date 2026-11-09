@@ -93,7 +93,7 @@ final class UpdateTransport: NSObject, URLSessionDataDelegate, @unchecked Sendab
             } catch { done(.failure(error)) }
         }
         do {
-            request(url: try endpoint("/parts"), token: token, limit: 131_072) { result in
+            request(url: try endpoint("/parts"), token: token, limit: UpdatePieceDescriptor.metadataLimit) { result in
                 guard !finished else { return }
                 do { try current(); let value = try UpdatePieceDescriptor.parse(result.get(), archive: archive); try current(); next(value, 0) }
                 catch { done(.failure(error)) }

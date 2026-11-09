@@ -203,7 +203,7 @@ private final class FixtureProtocol: URLProtocol {
         let archive = UpdateManifest.Archive(path: manifest.archive.path, size: payload.count, sha256: hash(payload), ed25519_signature: manifest.archive.ed25519_signature)
         let pieces = [payload.subdata(in: 0..<size), payload.subdata(in: size..<payload.count)]
         let rows: [[String: Any]] = pieces.enumerated().map { ["index": $0.offset, "size": $0.element.count, "sha256": hash($0.element)] }
-        let descriptor: [String: Any] = ["schema": "machine-monitor/artifact-parts/v1", "app_id": UpdateConfiguration.appID,
+        let descriptor: [String: Any] = ["schema": "machine-monitor/artifact-parts/v2", "app_id": UpdateConfiguration.appID,
             "release_id": "fixture", "kind": "archive", "artifact_sha256": archive.sha256, "artifact_size": archive.size, "part_size": size, "parts": rows]
         let json = try JSONSerialization.data(withJSONObject: descriptor)
         try check(try UpdatePieceDescriptor.parse(json, archive: archive).parts.count == 2, "bound piece descriptor")
@@ -212,6 +212,21 @@ private final class FixtureProtocol: URLProtocol {
         }
         let duplicate = String(decoding: json, as: UTF8.self).replacingOccurrences(of: "\"part_size\":", with: "\"part_size\":1,\"part_size\":")
         try refuses("duplicate piece descriptor key") { _ = try UpdatePieceDescriptor.parse(Data(duplicate.utf8), archive: archive) }
+        // Parse the full 512-MiB metadata boundary without allocating its payload.
+        let maximum = UpdateManifest.Archive(path: archive.path, size: 512 * 1024 * 1024, sha256: archive.sha256, ed25519_signature: archive.ed25519_signature)
+        let maximumRows: [[String: Any]] = (0..<2048).map { ["index": $0, "size": size, "sha256": archive.sha256] }
+        let maximumTable = descriptor.merging(["artifact_size": maximum.size, "parts": maximumRows]) { _, new in new }
+        let maximumJSON = try JSONSerialization.data(withJSONObject: maximumTable)
+        try check(maximumJSON.count < UpdatePieceDescriptor.metadataLimit, "maximum descriptor fits wire bound")
+        try check(try UpdatePieceDescriptor.parse(maximumJSON, archive: maximum).parts.last?.index == 2047, "maximum metadata and four-digit index")
+        let padded = maximumJSON + Data(repeating: 32, count: UpdatePieceDescriptor.metadataLimit - maximumJSON.count)
+        try check(try UpdatePieceDescriptor.parse(padded, archive: maximum).parts.count == 2048, "exact wire byte boundary")
+        try refuses("wire bound plus one") { _ = try UpdatePieceDescriptor.parse(padded + Data([32]), archive: maximum) }
+        for change in [["schema": "machine-monitor/artifact-parts/v1"], ["part_size": 1_048_576],
+                       ["parts": maximumRows + [maximumRows[0]]],
+                       ["parts": Array(maximumRows.dropLast()) + [maximumRows.last!.merging(["index": 2048]) { _, new in new }]]] as [[String: Any]] {
+            try refuses("maximum descriptor overflow or legacy contract") { _ = try UpdatePieceDescriptor.parse(JSONSerialization.data(withJSONObject: maximumTable.merging(change) { _, new in new }), archive: maximum) }
+        }
         var mode = "normal", requests = [String]()
         FixtureProtocol.handler = { request in
             let path = request.url!.path; requests.append(path)

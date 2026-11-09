@@ -292,7 +292,7 @@ class ChannelTests(unittest.TestCase):
     def test_private_readback_identifies_application_and_revokes_temporary_grant(self):
         api=delivery.Cloudflare.__new__(delivery.Cloudflare);api.config=self.api.config;api._opener=MagicMock()
         digest=hashlib.sha256(b'test').hexdigest()
-        table=dict(schema='machine-monitor/artifact-parts/v1',app_id=delivery.APP,release_id='fixture',kind='archive',
+        table=dict(schema='machine-monitor/artifact-parts/v2',app_id=delivery.APP,release_id='fixture',kind='archive',
                    artifact_sha256=digest,artifact_size=4,part_size=delivery.PIECE_SIZE,parts=[dict(index=0,size=4,sha256=digest)])
         metadata=MagicMock();metadata.status=200;metadata.read.return_value=json.dumps(table).encode()
         response=MagicMock();response.status=200;response.headers={'Content-Length':'4'};response.read.side_effect=[b'test',b'']
@@ -313,6 +313,79 @@ class ChannelTests(unittest.TestCase):
                 delivery.validate_piece_descriptor(json.dumps(dict(table,**change)).encode(),'fixture','archive',{'size':4,'sha256':digest})
         with self.assertRaises(delivery.DeliveryError):
             delivery.validate_piece_descriptor(json.dumps(table).replace('"part_size":','"part_size":1,"part_size":').encode(),'fixture','archive',{'size':4,'sha256':digest})
+
+    def test_maximum_v2_metadata_and_canonical_asset_indexes(self):
+        release_id = 'x' * 128
+        digest = 'a' * 64
+        descriptor = {'size': delivery.MAX_ARCHIVE, 'sha256': digest}
+        rows = [dict(index=i, size=delivery.PIECE_SIZE, sha256=digest) for i in range(2048)]
+        table = dict(schema='machine-monitor/artifact-parts/v2', app_id=delivery.APP,
+                     release_id=release_id, kind='archive', artifact_sha256=digest,
+                     artifact_size=delivery.MAX_ARCHIVE, part_size=delivery.PIECE_SIZE, parts=rows)
+        raw = json.dumps(table, separators=(',', ':')).encode()
+        self.assertLess(len(raw), delivery.WIRE_LIMIT)
+        self.assertEqual(len(delivery.validate_piece_descriptor(raw, release_id, 'archive', descriptor)), 2048)
+        self.assertEqual(len(delivery.validate_piece_descriptor(raw + b' ' * (delivery.WIRE_LIMIT - len(raw)), release_id, 'archive', descriptor)), 2048)
+        for changed in (dict(table, schema='machine-monitor/artifact-parts/v1'),
+                        dict(table, part_size=1048576), dict(table, parts=rows+[rows[0]]),
+                        dict(table, parts=rows[:-1]+[dict(rows[-1], index=2048)])):
+            with self.assertRaises(delivery.DeliveryError):
+                delivery.validate_piece_descriptor(json.dumps(changed).encode(), release_id, 'archive', descriptor)
+        with self.assertRaises(delivery.DeliveryError):
+            delivery.validate_piece_descriptor(raw + b' ' * (delivery.WIRE_LIMIT-len(raw)+1), release_id, 'archive', descriptor)
+        root = Path(self.api.config['assets_directory']) / '_private' / delivery.APP / release_id / 'archive' / digest
+        root.mkdir(parents=True, mode=0o700)
+        for directory in (Path(self.api.config['assets_directory']), *Path(self.api.config['assets_directory']).rglob('*')):
+            if directory.is_dir():directory.chmod(0o700)
+        content_hash = hashlib.sha256(b'x').hexdigest()
+        for index in ('2047', '2048', '02047', '9999'):
+            path = root / (index + '-' + content_hash + '.part')
+            path.write_bytes(b'x');path.chmod(0o600)
+            if index == '2047':
+                self.assertEqual(len(delivery.asset_inventory(self.api.config)), 1)
+            else:
+                with self.assertRaises(delivery.DeliveryError):delivery.asset_inventory(self.api.config)
+            path.unlink()
+
+    def test_interrupted_protocol_publication_retries_without_relabeling_legacy(self):
+        for failure in ('INSERT OR IGNORE INTO artifact_protocols', 'SELECT descriptor_schema,part_size', 'INSERT OR IGNORE INTO artifact_parts'):
+            with self.subTest(failure=failure):
+                api = MemoryAPI()
+                try:
+                    value = release()
+                    source = api.root / 'artifact.zip';source.write_bytes(b'test')
+                    original = api.query
+                    def interrupted(sql, params=()):
+                        if sql.startswith(failure):raise delivery.DeliveryError('Synthetic interruption')
+                        return original(sql, params)
+                    with patch.object(api, 'query', side_effect=interrupted), self.assertRaises(delivery.DeliveryError):
+                        delivery.publish(api, value, receipt(value), source, source)
+                    self.assertEqual(original('SELECT * FROM channels'), [])
+                    self.assertEqual(original('SELECT * FROM releases'), [])
+                    self.assertEqual(original('SELECT * FROM artifact_parts'), [])
+                    markers = original('SELECT * FROM artifact_protocols')
+                    self.assertEqual(len(markers), 0 if failure.startswith('INSERT OR IGNORE INTO artifact_protocols') else 1)
+                    delivery.publish(api, value, receipt(value), source, source)
+                    self.assertEqual(len(original('SELECT * FROM artifact_parts')), 2)
+                    self.assertEqual(len(original('SELECT * FROM artifact_protocols')), 2)
+                    self.assertEqual(len(original('SELECT * FROM channels')), 1)
+                finally:
+                    api.db.close();api.folder.cleanup()
+
+    def test_legacy_identity_cannot_be_relabeled_even_for_tiny_artifacts(self):
+        value = release()
+        source = self.api.root / 'legacy.zip';source.write_bytes(b'test')
+        release_id = value['archive']['path'].split('/')[-2]
+        descriptor = value['archive']
+        parts = [dict(index=0, size=4, sha256=descriptor['sha256'],
+            path=f"/_private/{delivery.APP}/{release_id}/archive/{descriptor['sha256']}/0-{descriptor['sha256']}.part")]
+        self.api.query('INSERT INTO artifact_parts VALUES(?,?,?,?,?)',
+                       (delivery.APP, release_id, 'archive', descriptor['sha256'], json.dumps(parts)))
+        with self.assertRaises(delivery.DeliveryError):
+            delivery.publish(self.api, value, receipt(value), source, source)
+        self.assertNotIn('deploy', self.api.events)
+        self.assertEqual(self.api.query('SELECT * FROM artifact_protocols'), [])
+        self.assertEqual(source.read_bytes(), b'test')
 
     def test_deployment_requires_unconditional_private_worker_first_and_owned_origin(self):
         config = self.api.config
@@ -397,8 +470,8 @@ class ChannelTests(unittest.TestCase):
         source.write_bytes(data)
         desc = {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
         parts = delivery.stage_artifact(self.api.config, source, 'fixture-1', 'archive', desc)
-        self.assertEqual([p['size'] for p in parts], [delivery.PIECE_SIZE]*20+[17])
-        self.assertEqual(len(delivery.asset_inventory(self.api.config)),21)
+        self.assertEqual([p['size'] for p in parts], [delivery.PIECE_SIZE]*(delivery.PART_SIZE//delivery.PIECE_SIZE)+[17])
+        self.assertEqual(len(delivery.asset_inventory(self.api.config)),delivery.PART_SIZE//delivery.PIECE_SIZE+1)
         api = delivery.Cloudflare.__new__(delivery.Cloudflare);api.config = self.api.config
         rows = [{'parts_json':json.dumps(parts)}]
         with patch.object(api,'query',return_value=rows):

@@ -55,7 +55,7 @@ class NativeWindowTests(unittest.TestCase):
             path = Path(temporary) / 'native-app-validation.json'
             subprocess.run([str(app / 'Contents/MacOS/Machine Monitor'), '--verify', str(path)], check=True, timeout=75)
             result = json.loads(path.read_text())
-            self.assertTrue(result['passed'])
+            self.assertTrue(result['passed'], json.dumps(result, sort_keys=True))
             self.assertTrue(result['nativeWebView'])
             self.assertTrue(result['minimizeStopsScan'])
             self.assertTrue(result['restoreStaysDormant'])

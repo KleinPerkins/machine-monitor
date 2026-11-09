@@ -193,24 +193,26 @@ struct UpdateManifest: Codable, Equatable {
 }
 
 struct UpdatePieceDescriptor: Decodable {
-    static let pieceSize = 1_048_576
+    static let pieceSize = 262_144
+    static let maxPieces = 2048
+    static let metadataLimit = 262_144
     struct Piece: Decodable { let index: Int; let size: Int; let sha256: String }
     let schema: String; let app_id: String; let release_id: String; let kind: String
     let artifact_sha256: String; let artifact_size: Int; let part_size: Int; let parts: [Piece]
     static func parse(_ data: Data, archive: UpdateManifest.Archive) throws -> Self {
-        guard data.count <= 131_072,
+        guard data.count <= metadataLimit,
               archive.path.range(of: "^/v1/apps/com\\.kleinperkins\\.machine-monitor/releases/[A-Za-z0-9_-]{1,128}/(archive|package)$", options: .regularExpression) != nil,
-              let object = try? UpdateJSON.object(data, limit: 131_072),
+              let object = try? UpdateJSON.object(data, limit: metadataLimit),
               Set(object.keys) == Set(["schema", "app_id", "release_id", "kind", "artifact_sha256", "artifact_size", "part_size", "parts"]),
-              let rows = object["parts"] as? [[String: Any]], !rows.isEmpty, rows.count <= 512,
+              let rows = object["parts"] as? [[String: Any]], !rows.isEmpty, rows.count <= maxPieces,
               rows.allSatisfy({ Set($0.keys) == Set(["index", "size", "sha256"]) })
         else { throw UpdateFailure.invalid("piece descriptor fields") }
         let value = try JSONDecoder().decode(Self.self, from: data)
         let path = archive.path.split(separator: "/")
-        guard value.schema == "machine-monitor/artifact-parts/v1", value.app_id == UpdateConfiguration.appID,
+        guard value.schema == "machine-monitor/artifact-parts/v2", value.app_id == UpdateConfiguration.appID,
               value.release_id == String(path[path.count - 2]), value.kind == String(path.last!),
               value.artifact_sha256 == archive.sha256, value.artifact_size == archive.size,
-              archive.size > 0, archive.size <= 512 * Self.pieceSize, value.part_size == Self.pieceSize,
+              archive.size > 0, archive.size <= Self.maxPieces * Self.pieceSize, value.part_size == Self.pieceSize,
               value.parts.count == (archive.size + Self.pieceSize - 1) / Self.pieceSize
         else { throw UpdateFailure.invalid("piece descriptor identity") }
         var total = 0
