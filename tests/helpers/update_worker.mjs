@@ -6,6 +6,12 @@ import {randomBytes,createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import worker from '../../delivery/worker.mjs';
 import {APP,manifest,PIECE_SIZE as PART_SIZE,parts,pieceDescriptor,parseWireJSON} from '../../delivery/contract.mjs';
+// Model the Workers length contract in Node: arbitrary streams lose a supplied
+// Content-Length, while FixedLengthStream advertises and enforces its byte count.
+const fixedLengths=new WeakMap();
+globalThis.FixedLengthStream=class extends TransformStream {
+ constructor(size){let count=0;super({transform(chunk,c){count+=chunk.byteLength;if(count>size)throw Error('fixed length exceeded');c.enqueue(chunk);},flush(){if(count!==size)throw Error('fixed length incomplete');}});fixedLengths.set(this.readable,size);}
+};
 export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 export function fixture(origin='https://download.example.invalid') {
   const db=new DatabaseSync(':memory:');db.exec(readFileSync(new URL('../../delivery/schema.sql',import.meta.url),'utf8'));
@@ -28,7 +34,12 @@ export function fixture(origin='https://download.example.invalid') {
   let primaryReads=0,assetReads=0;
   // The real Static Assets binding may omit Content-Length, including on HEAD.
   const env={UPDATE_ORIGIN:origin,DB:{withSession(mode){assert.equal(mode,'first-primary');primaryReads++;return{prepare(sql){return{bind(...params){return{async first(){return db.prepare(sql).get(...params)||null;}};}};}};}},ASSETS:{async fetch(request){assetReads++;assert.equal(request.headers.get('Authorization'),null);assert.equal(request.headers.get('Cloudflare-Workers-Version-Overrides'),null);const b=objects.get(new URL(request.url).pathname);return b?new Response(request.method==='HEAD'?null:new ReadableStream({start(controller){controller.enqueue(b);controller.close();}})):new Response(null,{status:404});}}};
-  const request=async(path,token=friend,options={})=>{const headers=new Headers(options.headers);if(token)headers.set('Authorization','Bearer '+token);return worker.fetch(new Request(origin+path,{...options,headers}),env);};
+  const request=async(path,token=friend,options={})=>{const headers=new Headers(options.headers);if(token)headers.set('Authorization','Bearer '+token);const response=await worker.fetch(new Request(origin+path,{...options,headers}),env);
+    if(response.body&&response.headers.get('Content-Type')==='application/octet-stream'){
+      const size=fixedLengths.get(response.body);
+      if(size===undefined)response.headers.delete('Content-Length');else response.headers.set('Content-Length',String(size));
+    }
+    return response;};
   return {db,env,friend,owner,expired,revoked,archive,first,objects,makeRelease,put,partRows,addGrant,request,get primaryReads(){return primaryReads;},get assetReads(){return assetReads;},close(){db.close();}};
 }
 async function run(){
@@ -109,7 +120,7 @@ async function run(){
    try{await ready;await new Promise(r=>setTimeout(r,0));assert.equal(settled,false);assertions++;}
    finally{releaseEOF();}
    const response=await pending;assert.equal(response.status,extra?503:200);
-   if(!extra){const bytes=Buffer.from(await response.arrayBuffer());assert.equal(bytes.length,PART_SIZE);assert.equal(hash(bytes),mp[0].sha256);}
+   if(!extra){assert.equal(response.headers.get('Content-Length'),String(PART_SIZE));const bytes=Buffer.from(await response.arrayBuffer());assert.equal(bytes.length,PART_SIZE);assert.equal(hash(bytes),mp[0].sha256);}
    assertions++;
   }
   f.env.ASSETS=real;
