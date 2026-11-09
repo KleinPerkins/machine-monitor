@@ -10,7 +10,8 @@ import {APP,manifest,PART_SIZE,parts} from '../../delivery/contract.mjs';
 globalThis.FixedLengthStream ??= class extends TransformStream {
   constructor(length) {
     let consumed=0;
-    super({transform(chunk,controller){consumed+=chunk.byteLength;if(consumed>length)throw new Error('length');controller.enqueue(chunk);},flush(){if(consumed!==length)throw new Error('length');}});
+    // Workerd identity writes copy bytes; generic TransformStream does not.
+    super({transform(chunk,controller){consumed+=chunk.byteLength;if(consumed>length)throw new Error('length');controller.enqueue(new Uint8Array(chunk));},flush(){if(consumed!==length)throw new Error('length');}});
   }
 };
 export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -58,7 +59,7 @@ async function run(){
    await expect('/'+APP+'/'+hash(f.archive)+'.zip',null,404);
    await expect('/v1/apps/other.app/channels/stable/manifest',f.friend,401);
    await expect(qual,f.friend,401);await expect(`/v1/apps/${APP}/releases/owner-3/archive`,f.friend,401);await expect(`/v1/apps/${APP}/releases/owner-3/package`,f.friend,401);
-   await expect(qual,f.owner,200);await expect(`/v1/apps/${APP}/releases/owner-3/archive`,f.owner,200);
+   await expect(qual,f.owner,200);await(await expect(`/v1/apps/${APP}/releases/owner-3/archive`,f.owner,200)).body.cancel();
    await expect(feed,f.owner,401);
    assert.throws(()=>f.db.prepare('INSERT INTO entitlements VALUES(?,?,?)').run('friend',APP,'qualification'));
    const check=await expect('/v1/access/check',f.friend,200,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app_id:APP,channel:'stable'})});
@@ -107,10 +108,41 @@ async function run(){
      let timeoutCancelled=0;
      f.env.ASSETS={fetch:async()=>new Response(new ReadableStream({cancel(){timeoutCancelled++;}}),{headers:{'Content-Length':String(f.archive.length)}})};
      const timeout=await expect(archive,f.friend,200);await assert.rejects(()=>timeout.arrayBuffer());assert.equal(timeoutCancelled,1);assertions++;
+     let stalledEOFCancelled=0;
+     f.env.ASSETS={fetch:async()=>new Response(new ReadableStream({start(c){c.enqueue(f.archive);},cancel(){stalledEOFCancelled++;}}))};
+     const stalledEOF=await expect(archive,f.friend,200);await assert.rejects(()=>stalledEOF.arrayBuffer());assert.equal(stalledEOFCancelled,1);assertions++;
    } finally {globalThis.setTimeout=originalTimer;f.env.ASSETS=actualAssets;}
    const realFetch=f.env.ASSETS.fetch;let cancelled=0,streamReads=0;
    f.env.ASSETS.fetch=async req=>{const response=await realFetch(req);return new Response(new ReadableStream({pull(c){streamReads++;c.enqueue(Buffer.from([1]));},cancel(){cancelled++;}}),{headers:response.headers});};
    const cancelResponse=await expect(archive,f.friend,200);assert(streamReads<=2);await cancelResponse.body.cancel();await new Promise(resolve=>setTimeout(resolve,0));assert.equal(cancelled,1);f.env.ASSETS.fetch=realFetch;assertions++;
+   let pendingCancelled=0;
+   f.env.ASSETS.fetch=async()=>new Response(new ReadableStream({pull(){return new Promise(()=>{});},cancel(){pendingCancelled++;}}));
+   const pending=await expect(archive,f.friend,200);await pending.body.cancel();await new Promise(resolve=>setTimeout(resolve,0));assert.equal(pendingCancelled,1);assertions++;
+   const aborted=new AbortController();
+   const interrupted=await expect(archive,f.friend,200,{signal:aborted.signal});aborted.abort();
+   await assert.rejects(()=>interrupted.arrayBuffer());assert.equal(pendingCancelled,2);assertions++;f.env.ASSETS.fetch=realFetch;
+   // Exercise Workers' readAtLeast API and reused buffers with distinct data
+   // across read and part boundaries. Standard Node BYOB uses its min option.
+   const patterned=Buffer.alloc(PART_SIZE+19);for(let i=0;i<patterned.length;i++)patterned[i]=i%251;
+   const native=f.makeRelease('stable','native-byob');native.archive.size=patterned.length;native.archive.sha256=hash(patterned);
+   const nativeParts=f.partRows(native,'archive',patterned);
+   f.db.prepare('INSERT INTO releases VALUES(?,?,?,?,?,?,?,?,?)').run(APP,'native-byob','stable',JSON.stringify(native),native.archive.sha256,native.archive.size,`${APP}/${native.archive.sha256}.zip`,native.qualification_id,'{}');
+   let nativeReads=0,maximumBuffer=0;
+   f.env.ASSETS.fetch=async request=>{
+     const bytes=f.objects.get(new URL(request.url).pathname);
+     const response=new Response(new ReadableStream({type:'bytes',start(c){c.enqueue(new Uint8Array(bytes));c.close();}}));
+     const get=response.body.getReader.bind(response.body);
+     response.body.getReader=options=>{const r=get(options);r.readAtLeast=(min,view)=>{nativeReads++;maximumBuffer=Math.max(maximumBuffer,view.byteLength);return r.read(view,{min});};return r;};
+     return response;
+   };
+   const nativePath=`/v1/apps/${APP}/releases/native-byob/archive`;let retained;
+   const nativeResponse=await worker.fetch(new Request('https://download.example.invalid'+nativePath,{headers:{Authorization:'Bearer '+f.friend}}),f.env,{waitUntil(task){retained=task;}});
+   const chunks=[];for await(const chunk of nativeResponse.body)chunks.push(chunk);
+   await retained;assert.equal(hash(Buffer.concat(chunks)),hash(patterned));assert.equal(nativeReads,8);assert.equal(maximumBuffer,4*1024*1024);assertions++;
+   const nativeFirst=f.objects.get(nativeParts[0].path);f.objects.set(nativeParts[0].path,Buffer.concat([nativeFirst,Buffer.from([1])]));
+   const extra=await expect(nativePath,f.friend,200);await assert.rejects(()=>extra.arrayBuffer());assertions++;f.objects.set(nativeParts[0].path,nativeFirst);
+   f.objects.set(nativeParts[1].path,Buffer.alloc(18));const short=await expect(nativePath,f.friend,200);await assert.rejects(()=>short.arrayBuffer());assertions++;
+   f.env.ASSETS=actualAssets;
    f.db.prepare('UPDATE grants SET revoked_at=? WHERE grant_id=?').run(Math.floor(Date.now()/1000),'friend');
    await expect(archive,f.friend,401);await expect(pkg,f.friend,401,{method:'HEAD'});
    const good=f.env.DB;f.env.DB={withSession(){throw new Error('private database failure');}};
