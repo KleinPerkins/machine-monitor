@@ -91,6 +91,28 @@ async function run(){
   // Exercise the native bounded BYOB path, including the mandatory EOF probe.
   for(const transfer of [false,true]){let readCount=0,position=0;const data=f.archive;f.env.ASSETS={fetch:async()=>({status:200,headers:new Headers(),body:{getReader({mode}={}){assert.equal(mode,'byob');return{async readAtLeast(min,view){readCount++;const n=Math.min(view.length,data.length-position);view.set(data.subarray(position,position+n));position+=n;const offset=view.byteOffset;const result=transfer?new Uint8Array(structuredClone(view.buffer,{transfer:[view.buffer]}),offset,n):view.subarray(0,n);return{value:result,done:n===0};},async cancel(){},releaseLock(){}};}}})};assert.equal((await(await expect(piece,f.friend,200)).text()),data.toString());assert.equal(readCount,2);assertions++;}
   f.env.ASSETS=real;
+  // A full-size read is not EOF. No response may escape while its final probe
+  // is pending, and an extra byte on that probe must fail before delivery.
+  for(const extra of [false,true]){
+   let releaseEOF,probeStarted,reads=0,settled=false;
+   const eof=new Promise(r=>releaseEOF=r),ready=new Promise(r=>probeStarted=r);
+   const data=f.objects.get(mp[0].path);
+   f.env.ASSETS={fetch:async()=>({status:200,headers:new Headers(),body:{getReader(){return{
+    async readAtLeast(min,view){
+     if(reads++===0){view.set(data);return{value:view.subarray(0,data.length),done:false};}
+     probeStarted();await eof;
+     if(extra){view[0]=1;return{value:view.subarray(0,1),done:false};}
+     return{value:view.subarray(0,0),done:true};
+    },async cancel(){},releaseLock(){}
+   };}}})};
+   const pending=f.request(path+'/parts/0',f.friend).then(r=>{settled=true;return r;});
+   try{await ready;await new Promise(r=>setTimeout(r,0));assert.equal(settled,false);assertions++;}
+   finally{releaseEOF();}
+   const response=await pending;assert.equal(response.status,extra?503:200);
+   if(!extra){const bytes=Buffer.from(await response.arrayBuffer());assert.equal(bytes.length,PART_SIZE);assert.equal(hash(bytes),mp[0].sha256);}
+   assertions++;
+  }
+  f.env.ASSETS=real;
   // Legacy immutable20MiB metadata remains valid for retention, but not new delivery.
   const legacy=f.makeRelease('stable','legacy-9');legacy.archive.size=20*PART_SIZE+1;legacy.archive.sha256='b'.repeat(64);const lp=[20*PART_SIZE,1].map((size,index)=>({index,size,sha256:'c'.repeat(64),path:`/_private/${APP}/legacy-9/archive/${legacy.archive.sha256}/${index}-${'c'.repeat(64)}.part`}));parts(lp,APP,'legacy-9','archive',legacy.archive);f.db.prepare('INSERT INTO artifact_parts VALUES(?,?,?,?,?)').run(APP,'legacy-9','archive',legacy.archive.sha256,JSON.stringify(lp));f.db.prepare('INSERT INTO releases VALUES(?,?,?,?,?,?,?,?,?)').run(APP,'legacy-9','stable',JSON.stringify(legacy),legacy.archive.sha256,legacy.archive.size,`${APP}/${legacy.archive.sha256}.zip`,legacy.qualification_id,'{}');const n=f.assetReads;await expect(`/v1/apps/${APP}/releases/legacy-9/archive/parts`,f.friend,503);assert.equal(f.assetReads,n);
   const legacyAssets=f.assetReads;await expect(`/v1/apps/${APP}/releases/legacy-9/archive/parts/0`,f.friend,503);await expect(`/v1/apps/${APP}/releases/legacy-9/archive/parts/0`,f.friend,503,{method:'HEAD'});assert.equal(f.assetReads,legacyAssets);

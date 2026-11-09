@@ -152,7 +152,13 @@ export default {async fetch(request, env, ctx) {
     const part=ordered[Number(a[5])];
     if(!part)return reply({error:'invalid_piece'},400);
     const response=await asset(env,approved,part,request.method,request.signal);
-    const body=request.method==='HEAD'?null:await pieceBytes(response,part,request.signal);
+    let body=null;
+    if(request.method!=='HEAD') {
+      const bytes=await pieceBytes(response,part,request.signal);
+      // EOF, size, cancellation and deadline checks finish before a response is
+      // created. Enqueue the owned validated buffer without a BufferSource copy.
+      body=new ReadableStream({start(controller){controller.enqueue(bytes);controller.close();}});
+    }
     return new Response(body,{headers:{...POLICY,
       'Content-Type':'application/octet-stream','Content-Length':String(part.size),'Accept-Ranges':'none'}});
   } catch {return reply({error:'service_unavailable'},503,{'Retry-After':'30'});}
