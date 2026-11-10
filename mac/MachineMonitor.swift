@@ -360,7 +360,11 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     func applicationDidHide(_ notification: Notification) { stopWhenHidden() }
     func windowDidMiniaturize(_ notification: Notification) { stopWhenHidden() }
     func windowDidChangeOcclusionState(_ notification: Notification) {
-        if window.occlusionState.contains(.visible) { startFirstScanIfVisible() } else { stopWhenHidden() }
+        if window.occlusionState.contains(.visible) {
+            startFirstScanIfVisible()
+            // Activation can precede unocclusion; notify when visibility arrives.
+            updates?.visibilityChanged()
+        } else { stopWhenHidden() }
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
         window.deminiaturize(nil)
@@ -540,6 +544,7 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 }
 
+#if !MONITOR_APP_LIBRARY
 @main
 struct MachineMonitorApplication {
     @MainActor static func main() {
@@ -549,3 +554,4 @@ struct MachineMonitorApplication {
         withExtendedLifetime(delegate) { application.run() }
     }
 }
+#endif

@@ -47,7 +47,12 @@ final class UpdateSparkleSession: NSObject, SPUUpdaterDelegate {
         if isVisible?() == true { DispatchQueue.main.async { [weak self] in self?.installIfVisible() } }
         return true
     }
-    func installIfVisible() { if isVisible?() == true { immediateInstall?() } }
+    func installIfVisible() {
+        guard isVisible?() == true, let install = immediateInstall else { return }
+        // Visibility events can repeat or reenter during the handoff.
+        immediateInstall = nil
+        install()
+    }
     func updaterShouldRelaunchApplication(_ updater: SPUUpdater) -> Bool { isVisible?() == true }
     func updaterWillRelaunchApplication(_ updater: SPUUpdater) {
         do { try onActualRelaunch?() } catch { onRecovery?() }

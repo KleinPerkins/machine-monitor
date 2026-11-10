@@ -55,6 +55,11 @@ final class UpdateCoordinator: NSObject {
     private var ready = false
     private var shutDown = false
 
+    init(deferredInstallSession: UpdateSparkleSession? = nil) {
+        sparkle = deferredInstallSession
+        super.init()
+    }
+
     static func bootstrap(bundle: Bundle = .main) -> UpdateCoordinator {
         let coordinator = UpdateCoordinator()
         // Source/fixture/ad-hoc bundles return before state, credential or network access.
