@@ -9,6 +9,16 @@ import {APP,manifest,PIECE_SIZE as PART_SIZE,MAX_PIECES,WIRE_LIMIT,INTERNAL_LIMI
 // Model the Workers length contract in Node: arbitrary streams lose a supplied
 // Content-Length, while FixedLengthStream advertises and enforces its byte count.
 const fixedLengths=new WeakMap();
+const NativeResponse=globalThis.Response;
+// Model fixed byte bodies at the wire boundary too: the synthetic HTTPS adapter
+// forwards these headers, while Node itself does not infer a byte-view length.
+globalThis.Response=class extends NativeResponse {
+ constructor(body,options){
+  const length=ArrayBuffer.isView(body)||body instanceof ArrayBuffer?body.byteLength:null;
+  super(body,options);
+  if(length!==null&&this.body){fixedLengths.set(this.body,length);this.headers.set('Content-Length',String(length));}
+ }
+};
 globalThis.FixedLengthStream=class extends TransformStream {
  constructor(size){let count=0;super({transform(chunk,c){count+=chunk.byteLength;if(count>size)throw Error('fixed length exceeded');c.enqueue(chunk);},flush(){if(count!==size)throw Error('fixed length incomplete');}});fixedLengths.set(this.readable,size);}
 };
@@ -150,6 +160,65 @@ async function run(){
   const maxTable=JSON.parse(meta);
   for(const change of [{schema:'machine-monitor/artifact-parts/v1'},{part_size:1024*1024},{parts:[...maxTable.parts,maxTable.parts[0]]}]){assert.throws(()=>pieceDescriptor({...maxTable,...change},maximum.archive));assertions++;}
   for(const sql of ["UPDATE artifact_protocols SET part_size=262144","DELETE FROM artifact_protocols"]){assert.throws(()=>f.db.prepare(sql).run());assertions++;}
+  // Fixed byte views preserve their slice length; arbitrary streams cannot
+  // manufacture a known length by supplying a header.
+  const view=new Uint8Array([8,7,6,5]).subarray(1,3),fixed=new Response(view);
+  assert.equal(fixedLengths.get(fixed.body),2);assert.equal(fixed.headers.get('Content-Length'),'2');assert.deepEqual([...new Uint8Array(await fixed.arrayBuffer())],[7,6]);
+  const unknown=new Response(new ReadableStream({start(c){c.enqueue(view);c.close();}}),{headers:{'Content-Length':'200'}});
+  assert.equal(fixedLengths.get(unknown.body),undefined);assert.equal((await unknown.arrayBuffer()).byteLength,2);assertions+=2;
+  {
+   const cacheRelease=f.makeRelease('stable','validation-cache-0');f.put(cacheRelease);
+   const cachePath=cacheRelease.archive.path,cacheRaw=f.db.prepare("SELECT parts_json FROM artifact_parts WHERE release_id=? AND kind='archive'").get('validation-cache-0').parts_json;
+   const realParse=JSON.parse,parses=new Map([[cacheRaw,0]]);
+   JSON.parse=(text,...args)=>{if(parses.has(text))parses.set(text,parses.get(text)+1);return realParse(text,...args);};
+   try{
+    const reads=f.primaryReads;
+    for(const [suffix,method] of [['/parts','GET'],['/parts/0','GET'],['/parts/0','HEAD']])await expect(cachePath+suffix,f.friend,200,{method});
+    assert.equal(parses.get(cacheRaw),1,'unchanged canonical metadata should be validated once');assert.equal(f.primaryReads,reads+3);assertions++;
+    // Warm validation must never turn into cached authorization or cached bytes.
+    const assets=f.assetReads;
+    for(const [column,value,restore] of [['revoked_at',1,null],['expires_at',1,Math.floor(Date.now()/1000)+3600]]){
+     f.db.prepare(`UPDATE grants SET ${column}=? WHERE grant_id='friend'`).run(value);
+     for(const [suffix,method] of [['/parts','GET'],['/parts/0','GET'],['/parts/0','HEAD']])await expect(cachePath+suffix,f.friend,401,{method});
+     assert.equal(f.assetReads,assets);f.db.prepare(`UPDATE grants SET ${column}=? WHERE grant_id='friend'`).run(restore);assertions++;
+    }
+    // Five small entries exceed the four-entry bound, so the oldest validates again.
+    for(let i=1;i<=4;i++){const item=f.makeRelease('stable','validation-cache-'+i);f.put(item);await expect(item.archive.path+'/parts',f.friend,200);}
+    await expect(cachePath+'/parts',f.friend,200);assert.equal(parses.get(cacheRaw),2,'oldest metadata must be evicted');assertions++;
+    const backing=f.env.DB;let override=null;
+    f.env.DB={withSession(mode){const session=backing.withSession(mode);return{prepare(sql){const statement=session.prepare(sql);return{bind(...params){const bound=statement.bind(...params);return{async first(){const row=await bound.first();return row&&override?override(row):row;}};}};}};}};
+    try{
+     for(const change of ['hash','size','kind','release','raw']){
+      const other=f.makeRelease('stable','validation-cache-other');if(change==='release')f.put(other);
+      override=row=>{
+       const value=realParse(row.manifest_json),edited={...row,parts_json:cacheRaw};
+       if(change==='hash'){value.archive.sha256='b'.repeat(64);edited.archive_sha256=value.archive.sha256;edited.object_key=`${APP}/${value.archive.sha256}.zip`;}
+       if(change==='size'){value.archive.size++;edited.archive_size=value.archive.size;}
+       if(change==='kind'){value.first_install.sha256=cacheRelease.archive.sha256;value.first_install.size=cacheRelease.archive.size;}
+       if(change==='raw')edited.parts_json=' '+cacheRaw;
+       edited.manifest_json=JSON.stringify(value);return edited;
+      };
+      const path=(change==='release'?other.archive.path:change==='kind'?cacheRelease.first_install.path:cachePath);
+      const before=f.assetReads;await expect(path+'/parts/0',f.friend,503);await expect(path+'/parts/0',f.friend,503,{method:'HEAD'});assert.equal(f.assetReads,before);assertions++;
+     }
+    }finally{f.env.DB=backing;}
+    // Two valid metadata tables larger than half the byte budget cannot coexist,
+    // even though their entry count is below four. Payloads stay synthetic/tiny.
+    const large=[];
+    for(const label of ['a','b']){
+     const rid=('validation-budget-'+label).padEnd(128,label),value=f.makeRelease('stable',rid);
+     value.archive.size=maximum.archive.size;value.archive.sha256=maximum.archive.sha256;
+     const rows=maxRows.map(row=>({...row,path:row.path.replace('/'+id+'/', '/'+rid+'/')})),raw=JSON.stringify(rows);
+     assert.ok(raw.length>INTERNAL_LIMIT/2&&raw.length<=INTERNAL_LIMIT);parts(rows,APP,rid,'archive',value.archive);
+     f.db.prepare('INSERT INTO artifact_parts VALUES(?,?,?,?,?)').run(APP,rid,'archive',value.archive.sha256,raw);
+     f.db.prepare('INSERT INTO artifact_protocols VALUES(?,?,?,?,?,?)').run(APP,rid,'archive',value.archive.sha256,'machine-monitor/artifact-parts/v2',PART_SIZE);
+     f.db.prepare('INSERT INTO releases VALUES(?,?,?,?,?,?,?,?,?)').run(APP,rid,'stable',JSON.stringify(value),value.archive.sha256,value.archive.size,`${APP}/${value.archive.sha256}.zip`,value.qualification_id,'{}');
+     large.push({path:value.archive.path,raw});parses.set(raw,0);
+    }
+    for(const item of [large[0],large[0],large[1],large[0]])await expect(item.path+'/parts',f.friend,200);
+    assert.equal(parses.get(large[0].raw),2,'metadata byte budget must evict before the entry cap');assertions++;
+   }finally{JSON.parse=realParse;}
+  }
   console.log(JSON.stringify({passed:true,assertions,primary_reads:f.primaryReads,asset_reads:f.assetReads}));
  }finally{f.close();}
 }

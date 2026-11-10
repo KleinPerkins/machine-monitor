@@ -9,8 +9,29 @@ const POLICY = {
   'Permissions-Policy':'camera=(), microphone=(), geolocation=()',
   'Strict-Transport-Security':'max-age=31536000',
 };
+const BINARY_HEADERS = new Headers({...POLICY,'Content-Type':'application/octet-stream','Accept-Ranges':'none'});
 const reply = (value, status=200, headers={}) => new Response(JSON.stringify(value), {status, headers:{...POLICY,'Content-Type':'application/json',...headers}});
 const deny = () => reply({error:'access_denied'},401);
+// Cache only exact immutable metadata validation, never grants or asset bodies.
+const checkedParts = new Map();
+let checkedPartsBytes = 0;
+function canonicalParts(raw, app, release, kind, descriptor) {
+  const hit = checkedParts.get(raw);
+  if (hit && hit.app === app && hit.release === release && hit.kind === kind &&
+      hit.sha256 === descriptor.sha256 && hit.size === descriptor.size) return hit.ordered;
+  const ordered = parts(JSON.parse(raw), app, release, kind, descriptor);
+  if (JSON.stringify(ordered) !== raw) throw new Error('parts');
+  for (const part of ordered) Object.freeze(part);
+  Object.freeze(ordered);
+  if (hit) { checkedParts.delete(raw); checkedPartsBytes -= raw.length; }
+  while (checkedParts.size >= 4 || checkedPartsBytes + raw.length > INTERNAL_LIMIT) {
+    const first = checkedParts.keys().next().value;
+    checkedParts.delete(first); checkedPartsBytes -= first.length;
+  }
+  checkedParts.set(raw, {app, release, kind, sha256:descriptor.sha256, size:descriptor.size, ordered});
+  checkedPartsBytes += raw.length;
+  return ordered;
+}
 const READ_MS=30000;
 async function timed(operation, cancel=()=>{}) {
   let timer;
@@ -133,12 +154,7 @@ export default {async fetch(request, env, ctx) {
     const artifact=a[3]==='package'?release.first_install:release.archive;
     if(row.descriptor_schema!=='machine-monitor/artifact-parts/v2'||row.part_size!==PIECE_SIZE)throw new Error('legacy transport');
     if(typeof row.parts_json!=='string'||row.parts_json.length>INTERNAL_LIMIT)throw new Error('parts');
-    const ordered=parts(JSON.parse(row.parts_json),APP,row.release_id,a[3],artifact);
-    // Owner publication stores compact JSON with scalar-only, closed part rows.
-    // After validating that flat shape, native round-trip equality rejects
-    // duplicate/escaped keys and other noncanonical encodings without a second
-    // character-by-character parser and its per-string allocations.
-    if(JSON.stringify(ordered)!==row.parts_json)throw new Error('parts');
+    const ordered=canonicalParts(row.parts_json,APP,row.release_id,a[3],artifact);
     // Conditional/range requests authorize first; never return a cached 304.
     if(request.headers.has('Range'))return reply({error:'ranges_unsupported'},416,{'Accept-Ranges':'none'});
     if([...request.headers.keys()].some(k=>k.startsWith('if-')))return reply({error:'conditions_unsupported'},400);
@@ -159,12 +175,12 @@ export default {async fetch(request, env, ctx) {
     let body=null;
     if(request.method!=='HEAD') {
       const bytes=await pieceBytes(response,part,request.signal);
-      // Validate EOF before creating a response. Workers only preserves the
-      // Content-Length of a stream when its fixed length is known to the runtime.
-      body=new ReadableStream({start(controller){controller.enqueue(bytes);controller.close();}})
-        .pipeThrough(new FixedLengthStream(bytes.byteLength),{signal:request.signal});
+      // EOF and size are validated before any bytes escape. Workers knows the
+      // fixed byte view's length without an additional stream pipeline.
+      body=bytes;
     }
-    return new Response(body,{headers:{...POLICY,
-      'Content-Type':'application/octet-stream','Content-Length':String(part.size),'Accept-Ranges':'none'}});
+    const headers=request.method==='HEAD'?new Headers(BINARY_HEADERS):BINARY_HEADERS;
+    if(request.method==='HEAD')headers.set('Content-Length',String(part.size));
+    return new Response(body,{headers});
   } catch {return reply({error:'service_unavailable'},503,{'Retry-After':'30'});}
 }};
