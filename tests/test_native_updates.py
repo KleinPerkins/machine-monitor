@@ -12,6 +12,48 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class NativeUpdateTests(unittest.TestCase):
+    def test_deferred_install_follows_actual_window_visibility_events(self):
+        framework = Path(os.environ["MONITOR_SPARKLE_FRAMEWORK_DIR"])
+        with tempfile.TemporaryDirectory(prefix="monitor-update-visibility-") as directory:
+            root = Path(directory)
+            contents = root / "Visibility Fixture.app/Contents"
+            executable = contents / "MacOS/Visibility"
+            executable.parent.mkdir(parents=True)
+            identifier = "test.machine-monitor.visibility." + uuid.uuid4().hex
+            (contents / "Info.plist").write_bytes(plistlib.dumps({
+                "CFBundleIdentifier": identifier,
+                "CFBundleExecutable": "Visibility", "CFBundleName": "Visibility Fixture",
+                "CFBundleVersion": "1", "CFBundleShortVersionString": "1.0",
+                "CFBundlePackageType": "APPL", "SUEnableAutomaticChecks": False,
+                "SUAllowsAutomaticUpdates": True, "SUAutomaticallyUpdate": True,
+                "SUVerifyUpdateBeforeExtraction": True,
+            }))
+            compiled = subprocess.run([
+                "xcrun", "swiftc", "-parse-as-library", "-D", "MONITOR_APP_LIBRARY",
+                "-F", str(framework), "-framework", "Sparkle",
+                "-Xlinker", "-rpath", "-Xlinker", str(framework),
+                "-module-cache-path", str(root / "module-cache"),
+                str(ROOT / "mac/MachineMonitor.swift"),
+                *map(str, sorted((ROOT / "mac").glob("Update*.swift"))),
+                str(ROOT / "tests/native/UpdateVisibility.swift"), "-o", str(executable),
+            ], capture_output=True, text=True, timeout=180)
+            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+            try:
+                for mode in ("late-occlusion", "duplicate", "reentrant"):
+                    with self.subTest(mode=mode):
+                        result = subprocess.run([str(executable), mode], capture_output=True, text=True, timeout=20)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertIn("DEFERRED_INSTALL_VISIBILITY passed", result.stdout)
+            finally:
+                # removePersistentDomain can leave an empty backing plist.
+                # Remove only this owned fixture's empty file after child exit.
+                preferences = Path.home() / "Library/Preferences" / (identifier + ".plist")
+                if preferences.exists():
+                    self.assertFalse(preferences.is_symlink())
+                    self.assertEqual(preferences.stat().st_uid, os.getuid())
+                    self.assertEqual(plistlib.loads(preferences.read_bytes()), {})
+                    preferences.unlink()
+
     def test_native_update_fixtures(self):
         with tempfile.TemporaryDirectory(prefix="monitor-native-updates-") as directory:
             output = Path(directory)
