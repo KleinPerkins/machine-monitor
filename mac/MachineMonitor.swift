@@ -479,6 +479,7 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
                                         self.js(self.probe) { shown in
                                             guard shown["active"] as? Bool == false else { self.verificationFailed("Restore unexpectedly resumed scan"); return }
                                             self.verification["restoreStaysDormant"] = true
+                                            guard self.verifyUpdateSettingsMenu() else { return }
                                             self.verification["passed"] = true
                                             self.saveVerification()
                                             self.window.performClose(nil)
@@ -491,6 +492,39 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 }
             }
         }
+    }
+    func verifyUpdateSettingsMenu() -> Bool {
+        guard let menu = NSApp.mainMenu?.items.first?.submenu,
+              let item = menu.items.first(where: { $0.title == "Update Settings…" }),
+              let action = item.action, let target = item.target,
+              NSApp.sendAction(action, to: target, from: item),
+              let panel = NSApp.windows.first(where: { $0.title == "Update Settings" && $0.isVisible }),
+              let scroll = panel.contentView?.subviews.compactMap({ $0 as? NSScrollView }).first,
+              let document = scroll.documentView else {
+            verificationFailed("Update Settings menu did not open its window"); return false
+        }
+        panel.contentView?.layoutSubtreeIfNeeded()
+        let controls = document.subviews.compactMap { $0 as? NSButton }
+        guard document.frame.height > 0,
+              controls.contains(where: { $0.title == "Import Access File…" }),
+              controls.contains(where: { $0.title == "Automatically check for updates" }) else {
+            verificationFailed("Update Settings controls are missing or collapsed"); return false
+        }
+        panel.performClose(nil)
+        guard !panel.isVisible, NSApp.sendAction(action, to: target, from: item), panel.isVisible,
+              let check = menu.items.first(where: { $0.title == "Check for Updates…" }),
+              let checkAction = check.action, let checkTarget = check.target else {
+            verificationFailed("Update Settings did not reopen"); return false
+        }
+        panel.performClose(nil)
+        guard NSApp.sendAction(checkAction, to: checkTarget, from: check), panel.isVisible else {
+            verificationFailed("Check for Updates menu did not open Settings"); return false
+        }
+        panel.performClose(nil)
+        verification["updateSettingsMenuOpens"] = true
+        verification["updateSettingsCloseReopen"] = true
+        verification["checkForUpdatesMenuOpens"] = true
+        return true
     }
     func verificationFailed(_ reason: String) {
         guard verifyPath != nil, !quitting else { return }
