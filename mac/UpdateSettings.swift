@@ -32,7 +32,6 @@ final class UpdateSettingsController: NSWindowController {
         version.font = .systemFont(ofSize: 20, weight: .semibold)
         status.setAccessibilityLabel("Update status"); status.setContentHuggingPriority(.defaultLow, for: .horizontal)
         status.maximumNumberOfLines = 0
-        status.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -48).isActive = true
         check = button("Check Now", #selector(checkNow))
         importButton = button("Import Access File…", #selector(importFile))
         remove = button("Remove Access…", #selector(removeAccess))
@@ -41,9 +40,12 @@ final class UpdateSettingsController: NSWindowController {
         automaticCheck = NSButton(checkboxWithTitle: "Automatically check for updates", target: self, action: #selector(toggleCheck))
         automaticInstall = NSButton(checkboxWithTitle: "Automatically install verified updates", target: self, action: #selector(toggleInstall))
         for view in [version, access, status, check, importButton, remove, automaticCheck, automaticInstall, install, discard, lastCheck] as [NSView] { stack.addArrangedSubview(view) }
+        // Activate inter-view constraints only after both views share a hierarchy.
+        status.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -48).isActive = true
         let detail = NSTextField(wrappingLabelWithString: "Updates use your private access and keep metrics on this Mac. A verified update waits until the scan ends. If installation is interrupted, open the separate Machine Monitor Recovery app.")
-        detail.textColor = .secondaryLabelColor; detail.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -48).isActive = true
+        detail.textColor = .secondaryLabelColor
         stack.addArrangedSubview(detail)
+        detail.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -48).isActive = true
         let controls = [check!, importButton!, remove!, automaticCheck!, automaticInstall!, install!, discard!]
         for i in 0..<(controls.count - 1) { controls[i].nextKeyView = controls[i + 1] }
         controls.last?.nextKeyView = controls.first; window.initialFirstResponder = check
