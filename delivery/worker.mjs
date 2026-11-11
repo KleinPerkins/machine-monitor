@@ -12,25 +12,46 @@ const POLICY = {
 const BINARY_HEADERS = new Headers({...POLICY,'Content-Type':'application/octet-stream','Accept-Ranges':'none'});
 const reply = (value, status=200, headers={}) => new Response(JSON.stringify(value), {status, headers:{...POLICY,'Content-Type':'application/json',...headers}});
 const deny = () => reply({error:'access_denied'},401);
-// Cache only exact immutable metadata validation, never grants or asset bodies.
+// Share a four-entry/1 MiB budget for exact immutable metadata validation.
+// Authorization and asset bodies are never cached; row bindings are checked on every request.
 const checkedParts = new Map();
 let checkedPartsBytes = 0;
+function rememberMetadata(raw, rawSize, entry) {
+  const prior = checkedParts.get(raw);
+  if (prior) { checkedParts.delete(raw); checkedPartsBytes -= prior.rawSize; }
+  while (checkedParts.size >= 4 || checkedPartsBytes + rawSize > INTERNAL_LIMIT) {
+    const first = checkedParts.keys().next().value;
+    checkedPartsBytes -= checkedParts.get(first).rawSize; checkedParts.delete(first);
+  }
+  checkedParts.set(raw, Object.freeze({...entry, rawSize})); checkedPartsBytes += rawSize;
+}
+function canonicalManifest(raw, app, channel, release) {
+  const hit = checkedParts.get(raw);
+  if (hit?.entryType === 'manifest' && hit.app === app && hit.channel === channel && hit.release === release) return hit.value;
+  const value = manifest(JSON.parse(raw), app, channel, release);
+  const pending = [value];
+  while (pending.length) {
+    const item = pending.pop();
+    if (item && typeof item === 'object' && !Object.isFrozen(item)) {
+      for (const child of Object.values(item)) if (child && typeof child === 'object') pending.push(child);
+      Object.freeze(item);
+    }
+  }
+  rememberMetadata(raw, new TextEncoder().encode(raw).byteLength, {entryType:'manifest', app, channel, release, value});
+  return value;
+}
 function canonicalParts(raw, app, release, kind, descriptor) {
   const hit = checkedParts.get(raw);
-  if (hit && hit.app === app && hit.release === release && hit.kind === kind &&
-      hit.sha256 === descriptor.sha256 && hit.size === descriptor.size) return hit.ordered;
+  if (hit?.entryType === 'parts' && hit.app === app && hit.release === release && hit.kind === kind &&
+      hit.sha256 === descriptor.sha256 && hit.size === descriptor.size) return hit.value;
   const ordered = parts(JSON.parse(raw), app, release, kind, descriptor);
   if (JSON.stringify(ordered) !== raw) throw new Error('parts');
   for (const part of ordered) Object.freeze(part);
   Object.freeze(ordered);
-  if (hit) { checkedParts.delete(raw); checkedPartsBytes -= raw.length; }
-  while (checkedParts.size >= 4 || checkedPartsBytes + raw.length > INTERNAL_LIMIT) {
-    const first = checkedParts.keys().next().value;
-    checkedParts.delete(first); checkedPartsBytes -= first.length;
-  }
-  checkedParts.set(raw, {app, release, kind, sha256:descriptor.sha256, size:descriptor.size, ordered});
-  checkedPartsBytes += raw.length;
-  return ordered;
+  const value=Object.freeze({ordered,bounded:ordered.length===Math.ceil(descriptor.size/PIECE_SIZE)&&
+    !ordered.some((p,i)=>p.size>PIECE_SIZE||(i<ordered.length-1&&p.size!==PIECE_SIZE))});
+  rememberMetadata(raw, raw.length, {entryType:'parts',app,release,kind,sha256:descriptor.sha256,size:descriptor.size,value});
+  return value;
 }
 const READ_MS=30000;
 async function timed(operation, cancel=()=>{}) {
@@ -132,11 +153,11 @@ export default {async fetch(request, env, ctx) {
     if((m||a)[1]!==APP)return deny();
     let row;
     if(m){
-      row=await primary(env,`SELECT r.* FROM channels c JOIN releases r USING(app_id,release_id,channel)
+      row=await primary(env,`SELECT r.release_id,r.channel,r.manifest_json,r.archive_sha256,r.archive_size,r.object_key FROM channels c JOIN releases r USING(app_id,release_id,channel)
         WHERE c.app_id=? AND c.channel=? AND EXISTS(SELECT 1 ${auth})`,[m[1],m[2],hash,m[1],m[2],now]);
     }else{
       if(!ID.test(a[2]))return deny();
-      row=await primary(env,`SELECT r.*,p.parts_json,t.descriptor_schema,t.part_size FROM releases r LEFT JOIN artifact_parts p
+      row=await primary(env,`SELECT r.release_id,r.channel,r.manifest_json,r.archive_sha256,r.archive_size,r.object_key,p.parts_json,t.descriptor_schema,t.part_size FROM releases r LEFT JOIN artifact_parts p
         ON p.app_id=r.app_id AND p.release_id=r.release_id AND p.kind='${a[3]}'
         AND p.artifact_sha256=json_extract(r.manifest_json,'$.${a[3]==='package'?'first_install':'archive'}.sha256')
         LEFT JOIN artifact_protocols t ON t.app_id=p.app_id AND t.release_id=p.release_id
@@ -149,14 +170,14 @@ export default {async fetch(request, env, ctx) {
     }
     if(!row)return deny();
     if(typeof row.manifest_json!=='string'||row.manifest_json.length>16384)throw new Error('manifest');
-    const release=manifest(JSON.parse(row.manifest_json),APP,m?.[2],row.release_id);
+    const release=canonicalManifest(row.manifest_json,APP,m?.[2],row.release_id);
     if(release.channel!==row.channel || release.archive.sha256!==row.archive_sha256 || release.archive.size!==row.archive_size ||
        row.object_key!==`${APP}/${release.archive.sha256}.zip`)throw new Error('manifest');
     if(m)return reply(release);
     const artifact=a[3]==='package'?release.first_install:release.archive;
     if(row.descriptor_schema!=='machine-monitor/artifact-parts/v2'||row.part_size!==PIECE_SIZE)throw new Error('legacy transport');
     if(typeof row.parts_json!=='string'||row.parts_json.length>INTERNAL_LIMIT)throw new Error('parts');
-    const ordered=canonicalParts(row.parts_json,APP,row.release_id,a[3],artifact);
+    const {ordered,bounded}=canonicalParts(row.parts_json,APP,row.release_id,a[3],artifact);
     // Conditional/range requests authorize first; never return a cached 304.
     if(request.headers.has('Range'))return reply({error:'ranges_unsupported'},416,{'Accept-Ranges':'none'});
     if([...request.headers.keys()].some(k=>k.startsWith('if-')))return reply({error:'conditions_unsupported'},400);
@@ -165,8 +186,7 @@ export default {async fetch(request, env, ctx) {
     if(!a[4])throw new Error('aggregate unavailable');
     // Retention also understands legacy20MiB and1MiB rows; every current route,
     // including HEAD, requires the bounded256KiB layout before reading any asset.
-    if(ordered.length!==Math.ceil(artifact.size/PIECE_SIZE)||
-       ordered.some((p,i)=>p.size>PIECE_SIZE||(i<ordered.length-1&&p.size!==PIECE_SIZE)))throw new Error('pieces');
+    if(!bounded)throw new Error('pieces');
     // Input metadata and bounded layout are already fully validated above.
     // Project only the three public fields; revalidating this new object repeats
     // the same per-piece work on every descriptor request.
