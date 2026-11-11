@@ -1,4 +1,4 @@
-import {APP, TOKEN, ID, origin, manifest, sha256, parts, PIECE_SIZE, MAX_PIECES, INTERNAL_LIMIT, pieceDescriptor} from './contract.mjs';
+import {APP, TOKEN, ID, origin, manifest, sha256, parts, PIECE_SIZE, MAX_PIECES, INTERNAL_LIMIT} from './contract.mjs';
 import {PAGE, CLIENT} from './web.mjs';
 const POLICY = {
   'Cache-Control':'private, no-store, max-age=0', 'CDN-Cache-Control':'no-store',
@@ -78,7 +78,9 @@ async function pieceBytes(response,part,signal) {
           else bytes.set(item.value,count);
           count+=item.value.byteLength;
         }else if(!item.done)throw new Error('length');
-        if(item.done)break;
+        // readAtLeast returns fewer than the requested minimum only at EOF.
+        // The size+1 probe therefore proves EOF without a redundant second read.
+        if(native || item.done)break;
       }
       if(cancelled||signal?.aborted||count!==part.size)throw new Error('length');
       return bytes.subarray(0,count);
@@ -165,9 +167,12 @@ export default {async fetch(request, env, ctx) {
     // including HEAD, requires the bounded256KiB layout before reading any asset.
     if(ordered.length!==Math.ceil(artifact.size/PIECE_SIZE)||
        ordered.some((p,i)=>p.size>PIECE_SIZE||(i<ordered.length-1&&p.size!==PIECE_SIZE)))throw new Error('pieces');
-    if(a[5]===undefined)return reply(pieceDescriptor({schema:'machine-monitor/artifact-parts/v2',app_id:APP,release_id:a[2],kind:a[3],
+    // Input metadata and bounded layout are already fully validated above.
+    // Project only the three public fields; revalidating this new object repeats
+    // the same per-piece work on every descriptor request.
+    if(a[5]===undefined)return reply({schema:'machine-monitor/artifact-parts/v2',app_id:APP,release_id:a[2],kind:a[3],
       artifact_sha256:artifact.sha256,artifact_size:artifact.size,part_size:PIECE_SIZE,
-      parts:ordered.map(({index,size,sha256})=>({index,size,sha256}))},artifact));
+      parts:ordered.map(({index,size,sha256})=>({index,size,sha256}))});
     if(Number(a[5])>=MAX_PIECES)return reply({error:'invalid_piece'},400);
     const part=ordered[Number(a[5])];
     if(!part)return reply({error:'invalid_piece'},400);
