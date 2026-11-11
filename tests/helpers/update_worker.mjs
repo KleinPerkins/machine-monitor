@@ -109,21 +109,20 @@ async function run(){
   }finally{globalThis.setTimeout=timer;}
   let cancelled=0,started;const ready=new Promise(r=>started=r);f.env.ASSETS={fetch:async()=>new Response(new ReadableStream({start(){started();},cancel(){cancelled++;}}))};const abort=new AbortController();const pending=f.request(piece,f.friend,{signal:abort.signal});await ready;abort.abort();assert.equal((await pending).status,503);assert.equal(cancelled,1);assertions++;
   f.env.ASSETS=real;
-  // Exercise the native bounded BYOB path, including the mandatory EOF probe.
-  for(const transfer of [false,true]){let readCount=0,position=0;const data=f.archive;f.env.ASSETS={fetch:async()=>({status:200,headers:new Headers(),body:{getReader({mode}={}){assert.equal(mode,'byob');return{async readAtLeast(min,view){readCount++;const n=Math.min(view.length,data.length-position);view.set(data.subarray(position,position+n));position+=n;const offset=view.byteOffset;const result=transfer?new Uint8Array(structuredClone(view.buffer,{transfer:[view.buffer]}),offset,n):view.subarray(0,n);return{value:result,done:n===0};},async cancel(){},releaseLock(){}};}}})};assert.equal((await(await expect(piece,f.friend,200)).text()),data.toString());assert.equal(readCount,2);assertions++;}
+  // Exercise the native bounded BYOB path, including EOF established by the size+1 minimum.
+  for(const transfer of [false,true]){let readCount=0,position=0;const data=f.archive;f.env.ASSETS={fetch:async()=>({status:200,headers:new Headers(),body:{getReader({mode}={}){assert.equal(mode,'byob');return{async readAtLeast(min,view){readCount++;assert.equal(min,data.length+1);const n=Math.min(view.length,data.length-position);view.set(data.subarray(position,position+n));position+=n;const offset=view.byteOffset;const result=transfer?new Uint8Array(structuredClone(view.buffer,{transfer:[view.buffer]}),offset,n):view.subarray(0,n);return{value:result,done:n===0};},async cancel(){},releaseLock(){}};}}})};assert.equal((await(await expect(piece,f.friend,200)).text()),data.toString());assert.equal(readCount,1);assertions++;}
   f.env.ASSETS=real;
-  // A full-size read is not EOF. No response may escape while its final probe
-  // is pending, and an extra byte on that probe must fail before delivery.
+  // readAtLeast(size+1) may resolve short only at EOF. Hold that first read
+  // while EOF is unknown; an extra byte must fail before a response escapes.
   for(const extra of [false,true]){
    let releaseEOF,probeStarted,reads=0,settled=false;
    const eof=new Promise(r=>releaseEOF=r),ready=new Promise(r=>probeStarted=r);
    const data=f.objects.get(mp[0].path);
    f.env.ASSETS={fetch:async()=>({status:200,headers:new Headers(),body:{getReader(){return{
     async readAtLeast(min,view){
-     if(reads++===0){view.set(data);return{value:view.subarray(0,data.length),done:false};}
-     probeStarted();await eof;
-     if(extra){view[0]=1;return{value:view.subarray(0,1),done:false};}
-     return{value:view.subarray(0,0),done:true};
+     assert.equal(min,PART_SIZE+1);assert.equal(++reads,1);probeStarted();await eof;
+     view.set(data);if(extra)view[data.length]=1;
+     return{value:view.subarray(0,data.length+Number(extra)),done:false};
     },async cancel(){},releaseLock(){}
    };}}})};
    const pending=f.request(path+'/parts/0',f.friend).then(r=>{settled=true;return r;});
