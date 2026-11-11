@@ -168,12 +168,14 @@ async function run(){
   {
    const cacheRelease=f.makeRelease('stable','validation-cache-0');f.put(cacheRelease);
    const cachePath=cacheRelease.archive.path,cacheRaw=f.db.prepare("SELECT parts_json FROM artifact_parts WHERE release_id=? AND kind='archive'").get('validation-cache-0').parts_json;
-   const realParse=JSON.parse,parses=new Map([[cacheRaw,0]]);
+   const manifestRaw=f.db.prepare('SELECT manifest_json FROM releases WHERE release_id=?').get('validation-cache-0').manifest_json;
+   const realParse=JSON.parse,parses=new Map([[cacheRaw,0],[manifestRaw,0]]);
    JSON.parse=(text,...args)=>{if(parses.has(text))parses.set(text,parses.get(text)+1);return realParse(text,...args);};
    try{
     const reads=f.primaryReads;
     for(const [suffix,method] of [['/parts','GET'],['/parts/0','GET'],['/parts/0','HEAD']])await expect(cachePath+suffix,f.friend,200,{method});
     assert.equal(parses.get(cacheRaw),1,'unchanged canonical metadata should be validated once');assert.equal(f.primaryReads,reads+3);assertions++;
+    assert.equal(parses.get(manifestRaw),1,'unchanged immutable release metadata should be validated once');assertions++;
     // Warm validation must never turn into cached authorization or cached bytes.
     const assets=f.assetReads;
     for(const [column,value,restore] of [['revoked_at',1,null],['expires_at',1,Math.floor(Date.now()/1000)+3600]]){
@@ -181,12 +183,19 @@ async function run(){
      for(const [suffix,method] of [['/parts','GET'],['/parts/0','GET'],['/parts/0','HEAD']])await expect(cachePath+suffix,f.friend,401,{method});
      assert.equal(f.assetReads,assets);f.db.prepare(`UPDATE grants SET ${column}=? WHERE grant_id='friend'`).run(restore);assertions++;
     }
-    // Five small entries exceed the four-entry bound, so the oldest validates again.
-    for(let i=1;i<=4;i++){const item=f.makeRelease('stable','validation-cache-'+i);f.put(item);await expect(item.archive.path+'/parts',f.friend,200);}
+    // A manifest and piece table share two entries per release. Three releases
+    // exceed the same four-entry budget, so the oldest validates again.
+    for(let i=1;i<=2;i++){const item=f.makeRelease('stable','validation-cache-'+i);f.put(item);await expect(item.archive.path+'/parts',f.friend,200);}
     await expect(cachePath+'/parts',f.friend,200);assert.equal(parses.get(cacheRaw),2,'oldest metadata must be evicted');assertions++;
     const backing=f.env.DB;let override=null;
     f.env.DB={withSession(mode){const session=backing.withSession(mode);return{prepare(sql){const statement=session.prepare(sql);return{bind(...params){const bound=statement.bind(...params);return{async first(){const row=await bound.first();return row&&override?override(row):row;}};}};}};}};
     try{
+     // A cached manifest never caches the surrounding row's current bindings.
+     for(const [key,value] of [['channel','qualification'],['archive_sha256','b'.repeat(64)],['archive_size',cacheRelease.archive.size+1],['object_key','wrong-object']]){
+      override=row=>({...row,[key]:value});const before=f.assetReads,reads=f.primaryReads;
+      await expect(cachePath+'/parts/0',f.friend,503);assert.equal(f.primaryReads,reads+1);assert.equal(f.assetReads,before);assertions++;
+     }
+     override=null;
      for(const change of ['hash','size','kind','release','raw']){
       const other=f.makeRelease('stable','validation-cache-other');if(change==='release')f.put(other);
       override=row=>{
@@ -216,6 +225,26 @@ async function run(){
     }
     for(const item of [large[0],large[0],large[1],large[0]])await expect(item.path+'/parts',f.friend,200);
     assert.equal(parses.get(large[0].raw),2,'metadata byte budget must evict before the entry cap');assertions++;
+    // Ignored duplicate-key values can make otherwise valid manifest text use
+    // more UTF-8 bytes than JS code units. Both metadata types share a byte cap.
+    const unicode=[];
+    for(const label of ['a','b']){
+     const rid=('unicode-budget-'+label).padEnd(128,label),value=f.makeRelease('stable',rid);
+     const all=Array.from({length:2048},(_,index)=>({index,path:`/_private/${APP}/${rid}/archive/${value.archive.sha256}/${index}-${'b'.repeat(64)}.part`,size:PART_SIZE,sha256:'b'.repeat(64)}));
+     let low=1,high=all.length;
+     while(low<high){const n=Math.ceil((low+high)/2);if(JSON.stringify(all.slice(0,n)).length<=512000)low=n;else high=n-1;}
+     const rows=all.slice(0,low),raw=JSON.stringify(rows);value.archive.size=rows.length*PART_SIZE;
+     const text='{"version":"'+'界'.repeat(7000)+'",'+JSON.stringify(value).slice(1);
+     f.db.prepare('INSERT INTO artifact_parts VALUES(?,?,?,?,?)').run(APP,rid,'archive',value.archive.sha256,raw);
+     f.db.prepare('INSERT INTO artifact_protocols VALUES(?,?,?,?,?,?)').run(APP,rid,'archive',value.archive.sha256,'machine-monitor/artifact-parts/v2',PART_SIZE);
+     f.db.prepare('INSERT INTO releases VALUES(?,?,?,?,?,?,?,?,?)').run(APP,rid,'stable',text,value.archive.sha256,value.archive.size,`${APP}/${value.archive.sha256}.zip`,value.qualification_id,'{}');
+     parses.set(text,0);unicode.push({path:value.archive.path,raw,text});
+    }
+    assert.ok(unicode.reduce((n,x)=>n+x.raw.length+x.text.length,0)<=INTERNAL_LIMIT);
+    assert.ok(unicode.reduce((n,x)=>n+Buffer.byteLength(x.raw)+Buffer.byteLength(x.text),0)>INTERNAL_LIMIT);
+    for(const item of [unicode[0],unicode[1],unicode[0]])await expect(item.path+'/parts',f.friend,200);
+    assert.equal(parses.get(unicode[0].text),2,'encoded manifest bytes must count toward the shared budget');assertions++;
+
    }finally{JSON.parse=realParse;}
   }
   console.log(JSON.stringify({passed:true,assertions,primary_reads:f.primaryReads,asset_reads:f.assetReads}));
