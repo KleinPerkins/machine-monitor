@@ -39,7 +39,7 @@ class NativeUpdateTests(unittest.TestCase):
             ], capture_output=True, text=True, timeout=180)
             self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
             try:
-                for mode in ("late-occlusion", "duplicate", "reentrant"):
+                for mode in ("late-occlusion", "duplicate", "reentrant", "timer-reconciliation"):
                     with self.subTest(mode=mode):
                         result = subprocess.run([str(executable), mode], capture_output=True, text=True, timeout=20)
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

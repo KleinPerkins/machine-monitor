@@ -54,7 +54,30 @@ private final class FixtureWindow: NSWindow {
         try require(accepted && calls == 0, "occluded install must remain deferred")
         let activation = Notification(name: NSApplication.didBecomeActiveNotification)
         let occlusion = Notification(name: NSWindow.didChangeOcclusionStateNotification, object: window)
-        if mode == "late-occlusion" {
+        if mode == "timer-reconciliation" {
+            // Exercise the actual production timer without final AppKit events.
+            // Every guard must still hold when the deferred handoff is retried.
+            coordinator.startInstallTimer()
+            coordinator.startInstallTimer()
+            defer { coordinator.shutdown() }
+            func tick() { RunLoop.main.run(until: Date().addingTimeInterval(2.15)) }
+            window.unoccluded = true; tick()
+            try require(calls == 0, "timer installed while inactive")
+            active = true; minimized = true; tick()
+            try require(calls == 0, "timer installed while minimized")
+            minimized = false; window.unoccluded = false; tick()
+            try require(calls == 0, "timer installed while occluded")
+            window.unoccluded = true; tick()
+            try require(calls == 1, "settled visible state without notification did not resume installation")
+            tick()
+            try require(calls == 1, "repeated timer tick repeated installation")
+            active = false
+            _ = session.updater(updater, willInstallUpdateOnQuit: item,
+                                immediateInstallationBlock: { calls += 1 })
+            coordinator.shutdown()
+            active = true; coordinator.visibilityChanged(); tick()
+            try require(calls == 1, "shutdown resumed deferred installation")
+        } else if mode == "late-occlusion" {
             // Activation arrives before AppKit's later visible-window event.
             active = true; controller.applicationDidBecomeActive(activation)
             try require(calls == 0, "activation while occluded installed")

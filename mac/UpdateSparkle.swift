@@ -1,4 +1,7 @@
 import AppKit
+import OSLog
+
+private let sparkleLifecycleLog = Logger(subsystem: "com.kleinperkins.machine-monitor", category: "updates")
 #if canImport(Sparkle)
 import Sparkle
 
@@ -32,6 +35,7 @@ final class UpdateSparkleSession: NSObject, SPUUpdaterDelegate {
         try updater.start()
         guard !updater.automaticallyChecksForUpdates, updater.allowsAutomaticUpdates, updater.automaticallyDownloadsUpdates
         else { throw UpdateFailure.invalid("updater effective settings") }
+        sparkleLifecycleLog.notice("sparkle_cycle_start")
         updater.checkForUpdatesInBackground()
     }
     func feedURLString(for updater: SPUUpdater) -> String? { feed.absoluteString }
@@ -43,6 +47,7 @@ final class UpdateSparkleSession: NSObject, SPUUpdaterDelegate {
     }
     func updater(_ updater: SPUUpdater, willInstallUpdateOnQuit item: SUAppcastItem, immediateInstallationBlock: @escaping () -> Void) -> Bool {
         guard item.versionString == String(build) else { onRecovery?(); return true }
+        sparkleLifecycleLog.notice("sparkle_quit_handoff_ready")
         immediateInstall = immediateInstallationBlock
         if isVisible?() == true { DispatchQueue.main.async { [weak self] in self?.installIfVisible() } }
         return true
@@ -51,13 +56,22 @@ final class UpdateSparkleSession: NSObject, SPUUpdaterDelegate {
         guard isVisible?() == true, let install = immediateInstall else { return }
         // Visibility events can repeat or reenter during the handoff.
         immediateInstall = nil
+        sparkleLifecycleLog.notice("sparkle_immediate_handoff")
         install()
     }
-    func updaterShouldRelaunchApplication(_ updater: SPUUpdater) -> Bool { isVisible?() == true }
+    func updaterShouldRelaunchApplication(_ updater: SPUUpdater) -> Bool {
+        let visible = isVisible?() == true
+        sparkleLifecycleLog.notice("sparkle_relaunch_visible=\(visible, privacy: .public)")
+        return visible
+    }
     func updaterWillRelaunchApplication(_ updater: SPUUpdater) {
+        sparkleLifecycleLog.notice("sparkle_actual_relaunch")
         do { try onActualRelaunch?() } catch { onRecovery?() }
     }
-    func updater(_ updater: SPUUpdater, didAbortWithError error: Error) { onRecovery?() }
+    func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
+        sparkleLifecycleLog.notice("sparkle_abort_code=\((error as NSError).code, privacy: .public)")
+        onRecovery?()
+    }
     // Cycle/session completion deliberately cannot release an install lease or resolve the journal.
 }
 #else
