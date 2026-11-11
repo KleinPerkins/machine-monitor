@@ -44,7 +44,12 @@ final class MonitorApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         updates?.isVisible = { [weak self] in
             guard let self else { return false }
-            return NSApp.isActive && self.window?.isVisible == true && self.window?.isMiniaturized == false && self.window?.occlusionState.contains(.visible) == true
+            let active = NSApp.isActive, visible = self.window?.isVisible == true
+            let minimized = self.window?.isMiniaturized != false
+            let unoccluded = self.window?.occlusionState.contains(.visible) == true
+            self.updates?.recordInstallerVisibility(active: active, visible: visible,
+                                                    minimized: minimized, unoccluded: unoccluded)
+            return active && visible && !minimized && unoccluded
         }
         updates?.onStateChange = { [weak self] in self?.updateStateChanged() }
         NSApp.setActivationPolicy(.regular)

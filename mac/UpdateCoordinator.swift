@@ -1,10 +1,18 @@
 import AppKit
+import OSLog
+
+private let updateLifecycleLog = Logger(subsystem: "com.kleinperkins.machine-monitor", category: "updates")
 
 enum UpdateInstallAdmission { case admitted(String), busy, unavailable }
 
 final class UpdateCoordinator: NSObject {
     enum Phase: String { case disabled, idle, checking, downloading, preflighting, ready, admitting, installerPending, recoveryRequired }
-    private(set) var phase: Phase = .disabled { didSet { refreshSettings(); onStateChange?() } }
+    private(set) var phase: Phase = .disabled {
+        didSet {
+            updateLifecycleLog.notice("phase=\(self.phase.rawValue, privacy: .public)")
+            refreshSettings(); onStateChange?()
+        }
+    }
     private(set) var startupDisposition: UpdateStartupDisposition = .ordinary
     private(set) var status = "Updates are unavailable in this build."
     private(set) var lastCheck: Date?
@@ -54,10 +62,12 @@ final class UpdateCoordinator: NSObject {
     private var backupPreparationInFlight = false
     private var ready = false
     private var shutDown = false
+    private var lastInstallerVisibility: Int?
 
     init(deferredInstallSession: UpdateSparkleSession? = nil) {
         sparkle = deferredInstallSession
         super.init()
+        if deferredInstallSession != nil { phase = .installerPending }
     }
 
     static func bootstrap(bundle: Bundle = .main) -> UpdateCoordinator {
@@ -124,9 +134,28 @@ final class UpdateCoordinator: NSObject {
         timer = Timer.scheduledTimer(withTimeInterval: 6 * 60 * 60, repeats: true) { [weak self] _ in
             guard let self, self.automaticChecks else { return }; self.checkForUpdates()
         }
-        installTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.tryInstall() }
+        startInstallTimer()
     }
-    func visibilityChanged() { sparkle?.installIfVisible(); tryInstall() }
+    func startInstallTimer() {
+        guard installTimer == nil, !shutDown else { return }
+        // AppKit events may precede settled visibility; reconcile through the same guards.
+        installTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.visibilityChanged() }
+    }
+    // Diagnostic payloads contain only enum names, flags and error codes.
+    // Credentials, URLs, paths, metrics and process inventories are never payloads.
+    func recordInstallerVisibility(active: Bool, visible: Bool, minimized: Bool, unoccluded: Bool) {
+        guard phase == .installerPending else { return }
+        // Bits: 1 active, 2 visible, 4 minimized, 8 unoccluded. Log changes only.
+        let flags = (active ? 1 : 0) | (visible ? 2 : 0) | (minimized ? 4 : 0) | (unoccluded ? 8 : 0)
+        guard flags != lastInstallerVisibility else { return }
+        lastInstallerVisibility = flags
+        updateLifecycleLog.notice("admitted_visibility_flags=\(flags, privacy: .public)")
+    }
+    func visibilityChanged() {
+        guard !shutDown else { return }
+        if phase == .installerPending { sparkle?.installIfVisible() }
+        tryInstall()
+    }
     func appendMenu(to menu: NSMenu) {
         menu.addItem(.separator())
         let check = menu.addItem(withTitle: "Check for Updates…", action: #selector(showCheck), keyEquivalent: "")
