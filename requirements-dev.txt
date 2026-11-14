@@ -1,5 +1,5 @@
 -r requirements.txt
-playwright==1.64.1
+playwright==1.65.0
 greenlet==3.5.6
 pyee==14.0.0
 typing-extensions==4.16.0
