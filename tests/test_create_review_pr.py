@@ -77,9 +77,16 @@ class CreationTests(unittest.TestCase):
         self.enrollment = {'id': 'work-local', 'origin_account': 'work', 'email': 'owner@example.invalid',
                            'workspace': 'private-workspace', 'cli_version': 'codex-cli 0.148.0', 'credential_store': 'keyring',
                            'codex_home': str(Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))).resolve())}
+        self.policy_value = {'schema': 'g1-review-enrollments/v1', 'repository_id': m.REPOSITORY_ID,
+            'enabled': True, 'producers': [dict(id='work-local', origin_account='work', enabled=True,
+                github_user_id=m.OWNER_ID, cli_version=self.enrollment['cli_version'], credential_store='keyring',
+                instructions_sha256=m.review.digest(m.review.INSTRUCTIONS),
+                creation_adapter_sha256=m.review.digest(Path(m.__file__).read_bytes()),
+                capture_adapter_sha256=m.review.digest(Path(m.review.__file__).read_bytes()))]}
+        self.policy = m.review.canonical(self.policy_value).encode()
         self.request = {'repository': m.REPOSITORY, 'repository_id': m.REPOSITORY_ID, 'head_sha': 'a' * 40,
                         'base_sha': 'b' * 40, 'merge_base_sha': 'c' * 40, 'diff_sha256': 'd' * 64,
-                        'policy_sha256': m.review.digest(b'policy'), 'origin_account': 'work'}
+                        'policy_sha256': m.review.digest(self.policy), 'origin_account': 'work'}
         report = {'verdict': 'pass', 'coverage': 'complete', 'summary': 'All supplied changed lines examined.', 'findings': [], 'unresolved_findings': []}
         self.receipt = {'schema': m.review.SCHEMA, 'capture_id': '11111111-1111-4111-8111-111111111111',
                         'trust_model': 'q16-operational-local', 'tuple': copy.deepcopy(self.request),
@@ -102,7 +109,7 @@ class CreationTests(unittest.TestCase):
         return result
 
     def create(self, **kwargs):
-        args = dict(repo=self.root, request=self.request, policy=b'policy', enrollment=self.enrollment,
+        args = dict(repo=self.root, request=self.request, policy=self.policy, enrollment=self.enrollment,
                     receipt=self.receipt, title='Reviewed change', body='Concrete behavior and validation.',
                     output=self.output, journal=self.journal, api=self.api)
         args.update(kwargs)
@@ -148,6 +155,21 @@ class CreationTests(unittest.TestCase):
                 self.enrollment = old
                 self.account_mock.return_value = self.account
                 self.run_mock.return_value = old['cli_version'].encode()
+
+    def test_unenrolled_adapters_or_disabled_producers_cannot_create_pr(self):
+        changes = [lambda v: v.update(enabled=False),
+                   lambda v: v.update(repository_id=1297059298),
+                   lambda v: v['producers'][0].update(enabled=False),
+                   lambda v: v['producers'].append(copy.deepcopy(v['producers'][0])),
+                   lambda v: v['producers'][0].update(creation_adapter_sha256='f' * 64),
+                   lambda v: v['producers'][0].update(capture_adapter_sha256='f' * 64)]
+        for change in changes:
+            value = copy.deepcopy(self.policy_value)
+            change(value)
+            with self.subTest(policy=value), self.assertRaises(m.review.CaptureError):
+                self.create(policy=m.review.canonical(value).encode())
+            self.assertEqual(self.api.calls, [])
+            self.assertFalse(self.journal.exists())
 
     def test_wrong_github_repo_head_base_refuse_before_create(self):
         cases = [('owner', lambda: self.api.user.update(id=7)), ('repo', lambda: self.api.repo.update(id=7)),

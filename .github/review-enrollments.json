@@ -15,7 +15,7 @@
         "b2fc6975a5637afa2ac999a3260fc7980db0be97b0474c7a8a14c57e18d4a6e1",
         "de8c81bdbcbc27db4d16d6ea11b6463544d5351492a5b397d3d31af1fbc78ca3"
       ],
-      "creation_adapter_sha256": "f2e70ae5906ded400dc41a02b2abfe31a7d1dc4e0662bb4f4b936d6c083f943d",
+      "creation_adapter_sha256": "dacd886515eeb0e60c7b6e8d470522f25f7d6310df6fb8e9b7e2d65b9e79a52c",
       "capture_adapter_sha256": "8a87b2fb4f01d99cc42d4c19d7c38744682362d0974c94ef3b6443526adab365"
     },
     {
@@ -29,7 +29,7 @@
       "allowed_startup_notice_sha256": [
         "b2fc6975a5637afa2ac999a3260fc7980db0be97b0474c7a8a14c57e18d4a6e1"
       ],
-      "creation_adapter_sha256": "f2e70ae5906ded400dc41a02b2abfe31a7d1dc4e0662bb4f4b936d6c083f943d",
+      "creation_adapter_sha256": "dacd886515eeb0e60c7b6e8d470522f25f7d6310df6fb8e9b7e2d65b9e79a52c",
       "capture_adapter_sha256": "8a87b2fb4f01d99cc42d4c19d7c38744682362d0974c94ef3b6443526adab365"
     }
   ],
@@ -40,6 +40,7 @@
     "activation": "Source enrollment is not operational qualification. Retain current controls until the reviewed source lands and final current-main CI, account receipt admission, App readiness and owner-visible bypass policy have been verified. Agents do not merge, bypass checks or manipulate PR auto-merge.",
     "reference": "KleinPerkins/kp-pr-bot-canary at 75148194a0e8b0f63674a3e441639cc633ca12b8; repository identity and CI evidence are adapted here.",
     "coordination": "The authoring agent automatically captures review, creates the PR/origin witness, and separately publishes the unedited review receipt with the g1-review-receipt:v1 marker. The creation adapter is deliberately origin-only. No human technical-review or receipt-publication step is required.",
-    "administrative_visibility": "The delivery coordinator must inspect exact owner-visible bypass actors before activation. App-scoped omission remains explicitly unknown; App qualification does not attest hidden actors. Visible unexpected actors reject, and Integration/App bypass is unauthorized. This accepted administrative boundary is operational trust, not protection against a privileged owner changing controls after qualification."
+    "administrative_visibility": "The delivery coordinator must inspect exact owner-visible bypass actors before activation. App-scoped omission remains explicitly unknown; App qualification does not attest hidden actors. Visible unexpected actors reject, and Integration/App bypass is unauthorized. This accepted administrative boundary is operational trust, not protection against a privileged owner changing controls after qualification.",
+    "ambiguous_creation": "An ambiguous create/origin-publication response deliberately blocks automatic delivery. The agent preserves the journal and diagnoses actual branch/nonce/PR/comment state read-only. No blind retry, duplicate PR or inferred account witness is authorized; automatic coordination does not require unconditional recovery from unknown origin."
   }
 }
