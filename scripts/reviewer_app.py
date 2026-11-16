@@ -19,6 +19,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+DIFF_CONFIG = ('-c', 'diff.renames=false', '-c', 'diff.noprefix=false', '-c', 'diff.mnemonicprefix=false',
+               '-c', 'core.quotePath=true', '-c', 'core.abbrev=40', '-c', 'diff.context=3',
+               '-c', 'diff.interHunkContext=0', '-c', 'diff.algorithm=myers', '-c', 'diff.indentHeuristic=false',
+               '-c', 'diff.suppressBlankEmpty=false')
+
 REPOSITORY = 'KleinPerkins/machine-monitor'
 REPOSITORY_ID = 1449284973
 APP_ID = 4217367
@@ -343,7 +348,7 @@ def git_tuple(head, base, token):
                 return data
         command('init', '--bare', '.')
         merge_base = bounded_merge_base(command, base, head)
-        patch = command('-c', 'color.ui=false', 'diff', '--no-ext-diff', '--no-textconv', '--binary', base+'...'+head, '--')
+        patch = command(*DIFF_CONFIG, '-c', 'color.ui=false', 'diff', '--no-ext-diff', '--no-textconv', '--binary', base+'...'+head, '--')
         return merge_base, digest(patch)
 
 def validate_ci_log(log, pr, merge_sha, run):

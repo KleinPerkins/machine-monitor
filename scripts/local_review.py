@@ -14,6 +14,11 @@ import tempfile
 import time
 import uuid
 
+DIFF_CONFIG = ('-c', 'diff.renames=false', '-c', 'diff.noprefix=false', '-c', 'diff.mnemonicprefix=false',
+               '-c', 'core.quotePath=true', '-c', 'core.abbrev=40', '-c', 'diff.context=3',
+               '-c', 'diff.interHunkContext=0', '-c', 'diff.algorithm=myers', '-c', 'diff.indentHeuristic=false',
+               '-c', 'diff.suppressBlankEmpty=false')
+
 SCHEMA = 'g1-local-review/v1'
 MAX_INPUT = 1024 * 1024
 MAX_OUTPUT = 2 * 1024 * 1024
@@ -169,6 +174,7 @@ def git(repo,*args):
  for key in sorted(set(keys.decode().split('\0'))):
   match=re.fullmatch(r'filter\.(.+)\.(clean|smudge|process|required)',key,re.DOTALL)
   if match:argv+=['-c',key+('=false' if match[2]=='required' else '=')]
+ if args and args[0] == 'diff':argv+=list(DIFF_CONFIG)
  return run(argv+list(args),timeout=30,env=env)
 
 def frozen_input(repo,request,policy):
