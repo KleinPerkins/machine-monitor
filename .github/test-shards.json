@@ -15,7 +15,10 @@
       "tests": [
         "tests/test_governance.py",
         "tests/test_automation.py",
-        "tests/test_toolchain.py"
+        "tests/test_toolchain.py",
+        "tests/test_local_review.py",
+        "tests/test_create_review_pr.py",
+        "tests/test_reviewer_app.py"
       ],
       "command": [
         "python3",

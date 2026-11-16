@@ -102,6 +102,31 @@ class ShardContracts(unittest.TestCase):
 
 
 class RepositoryPolicy(unittest.TestCase):
+    def test_hosted_aggregate_identity_rejects_wrong_run_source_and_pr_tuple(self):
+        from scripts.verify import identity
+        expected = dict(GITHUB_REPOSITORY='KleinPerkins/machine-monitor',
+                        GITHUB_REPOSITORY_ID='1449284973', GITHUB_EVENT_NAME='pull_request',
+                        GITHUB_SHA='a' * 40, GITHUB_WORKFLOW_SHA='a' * 40,
+                        GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='2',
+                        GITHUB_REF='refs/pull/12/merge', CI_HEAD_SHA='b' * 40,
+                        CI_BASE_SHA='c' * 40, GITHUB_WORKFLOW='CI',
+                        GITHUB_WORKFLOW_REF='KleinPerkins/machine-monitor/.github/workflows/ci.yml@refs/pull/12/merge')
+        self.assertEqual(identity(expected)['base_sha'], 'c' * 40)
+        for field, value in [('GITHUB_REPOSITORY_ID', '1297059298'),
+                             ('GITHUB_EVENT_NAME', 'pull_request_target'),
+                             ('GITHUB_WORKFLOW_SHA', 'd' * 40),
+                             ('GITHUB_RUN_ATTEMPT', '0'), ('CI_HEAD_SHA', ''),
+                             ('GITHUB_REF', 'refs/heads/main')]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                identity(dict(expected, **{field: value}))
+        for event in ('push', 'workflow_dispatch'):
+            main = dict(expected, GITHUB_EVENT_NAME=event, GITHUB_REF='refs/heads/main',
+                        CI_HEAD_SHA='', CI_BASE_SHA='',
+                        GITHUB_WORKFLOW_REF='KleinPerkins/machine-monitor/.github/workflows/ci.yml@refs/heads/main')
+            self.assertEqual(identity(main)['event'], event)
+            with self.assertRaises(ValueError):
+                identity(dict(main, CI_BASE_SHA='c' * 40))
+
     def test_workflow_has_complete_unfiltered_bounded_matrix(self):
         source = (ROOT / '.github/workflows/ci.yml').read_text()
         for identity in IDS:

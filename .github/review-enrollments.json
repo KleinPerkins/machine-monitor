@@ -1,0 +1,43 @@
+{
+  "schema": "g1-review-enrollments/v1",
+  "repository_id": 1449284973,
+  "enabled": true,
+  "producers": [
+    {
+      "id": "enrollment-24c0a5f2",
+      "enabled": true,
+      "origin_account": "origin-7612de79",
+      "github_user_id": 49759187,
+      "instructions_sha256": "7efd718dd897e06155b8e49eca37d18b15fb1e47610d9cf4b2d26e294a99e10b",
+      "cli_version": "codex-cli 0.148.0",
+      "credential_store": "keyring",
+      "allowed_startup_notice_sha256": [
+        "b2fc6975a5637afa2ac999a3260fc7980db0be97b0474c7a8a14c57e18d4a6e1",
+        "de8c81bdbcbc27db4d16d6ea11b6463544d5351492a5b397d3d31af1fbc78ca3"
+      ],
+      "creation_adapter_sha256": "f2e70ae5906ded400dc41a02b2abfe31a7d1dc4e0662bb4f4b936d6c083f943d",
+      "capture_adapter_sha256": "8a87b2fb4f01d99cc42d4c19d7c38744682362d0974c94ef3b6443526adab365"
+    },
+    {
+      "id": "enrollment-e876e8eb",
+      "enabled": true,
+      "origin_account": "origin-6a644d43",
+      "github_user_id": 49759187,
+      "instructions_sha256": "7efd718dd897e06155b8e49eca37d18b15fb1e47610d9cf4b2d26e294a99e10b",
+      "cli_version": "codex-cli 0.148.0",
+      "credential_store": "file",
+      "allowed_startup_notice_sha256": [
+        "b2fc6975a5637afa2ac999a3260fc7980db0be97b0474c7a8a14c57e18d4a6e1"
+      ],
+      "creation_adapter_sha256": "f2e70ae5906ded400dc41a02b2abfe31a7d1dc4e0662bb4f4b936d6c083f943d",
+      "capture_adapter_sha256": "8a87b2fb4f01d99cc42d4c19d7c38744682362d0974c94ef3b6443526adab365"
+    }
+  ],
+  "governance": {
+    "repository": "KleinPerkins/machine-monitor",
+    "scope": "Existing six meaningful hosted CI shards plus automatic independent review from the PR-creation Codex account and Chaos Scheduler App-owned native squash delivery. No product, installed runtime or release change.",
+    "review_trust": "Owner-enrolled operational local capture. Work and personal origins are distinct; a review receipt cannot establish origin. No provider-signature or same-principal anti-forgery claim.",
+    "activation": "Source enrollment is not operational qualification. Retain current controls until the reviewed source lands and final current-main CI, account receipt admission, App readiness and owner-visible bypass policy have been verified. Agents do not merge, bypass checks or manipulate PR auto-merge.",
+    "reference": "KleinPerkins/kp-pr-bot-canary at 75148194a0e8b0f63674a3e441639cc633ca12b8; repository identity and CI evidence are adapted here."
+  }
+}

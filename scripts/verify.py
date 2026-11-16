@@ -16,6 +16,38 @@ from scripts.processes import run_owned
 from scripts.shard_contract import IDS, aggregate, contract, parse
 
 
+def identity_require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def identity(environment: dict[str, str]) -> dict[str, str]:
+    names = ("GITHUB_REPOSITORY", "GITHUB_REPOSITORY_ID", "GITHUB_EVENT_NAME", "GITHUB_SHA",
+             "GITHUB_WORKFLOW_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_REF",
+             "CI_HEAD_SHA", "CI_BASE_SHA", "GITHUB_WORKFLOW_REF", "GITHUB_WORKFLOW")
+    value = {key: environment.get(name, "") for key, name in zip(('repository', 'repository_id', 'event', 'revision', 'workflow_sha', 'run_id', 'run_attempt', 'ref', 'head_sha', 'base_sha', 'workflow_ref', 'workflow'), names)}
+    identity_require(value["repository"] == "KleinPerkins/machine-monitor", "wrong repository")
+    identity_require(value["repository_id"] == "1449284973", "wrong immutable repository id")
+    identity_require(value["event"] in {"push", "pull_request", "workflow_dispatch"}, "unsupported CI event")
+    for key in ("revision", "workflow_sha"):
+        identity_require(bool(re.fullmatch(r"[0-9a-f]{40}", value[key])), f"invalid {key}")
+    for key in ("run_id", "run_attempt"):
+        identity_require(bool(re.fullmatch(r"[1-9][0-9]*", value[key])), f"invalid {key}")
+    if value["event"] == "pull_request":
+        identity_require(bool(re.fullmatch(r"refs/pull/[1-9][0-9]*/merge", value["ref"])), "expected PR merge ref")
+        for key in ("head_sha", "base_sha"):
+            identity_require(bool(re.fullmatch(r"[0-9a-f]{40}", value[key])), f"invalid {key}")
+    else:
+        identity_require(value["ref"] == "refs/heads/main", "push must target main")
+        identity_require(value["head_sha"] == value["base_sha"] == "", "unexpected PR identity on push")
+    identity_require(value["workflow"] == "CI", "wrong workflow name")
+    identity_require(value["workflow_sha"] == value["revision"], "workflow revision differs from tested source")
+    identity_require(value["workflow_ref"] == "KleinPerkins/machine-monitor/.github/workflows/ci.yml@" + value["ref"],
+            "wrong workflow path or ref")
+    return value
+
+
+
 def run_suite(files):
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -158,7 +190,12 @@ def main():
         for identity in IDS:
             evidence(output, identity, run_id, current, value['contract_sha256'])
         reports = [parse(path.read_bytes()) for path in sorted(output.glob('result-*.json'))]
-        print(json.dumps(aggregate(value, reports, current), indent=2))
+        result = aggregate(value, reports, current)
+        print(json.dumps(result, indent=2))
+        if os.environ.get('GITHUB_ACTIONS') == 'true':
+            actual = identity(dict(os.environ))
+            identity_require(actual['revision'] == current, 'aggregate checkout differs from tested revision')
+            print('MACHINE_MONITOR_CI_AGGREGATE_V1 ' + json.dumps({'schema': 'machine-monitor-ci-aggregate/v1', 'identity': actual, 'result': 'success'}, sort_keys=True, separators=(',', ':')))
         return
     run_shard(args.shard, output, value, current, run_id)
 
