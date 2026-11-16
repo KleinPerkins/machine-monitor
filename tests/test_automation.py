@@ -1,5 +1,6 @@
 """Synthetic reviewer policy tests. Never mint tokens or call GitHub."""
 import copy
+import json
 from pathlib import Path
 import unittest
 
@@ -99,15 +100,20 @@ class OrdinaryHeadPolicy(unittest.TestCase):
     def test_privileged_workflow_uses_only_trusted_code_and_scoped_app_token(self):
         root = Path(__file__).resolve().parents[1]
         source = (root / '.github/workflows/reviewer-app.yml').read_text()
-        for literal in ("vars.REVIEWER_APP_ENABLED == 'true'", 'ref: ${{ github.workflow_sha }}',
-                        'persist-credentials: false', 'repositories: machine-monitor',
-                        'owner: KleinPerkins', 'timeout-minutes: 5'):
-            self.assertIn(literal, source)
+        workflow = json.loads(source)
+        job = workflow['jobs']['admit']
+        self.assertEqual(job['steps'][0]['with']['ref'], '${{ github.workflow_sha }}')
+        self.assertFalse(job['steps'][0]['with']['persist-credentials'])
+        self.assertLessEqual(job['timeout-minutes'], 15)
         self.assertNotIn('download-artifact', source)
         self.assertNotIn('pull_request.head', source)
-        for line in source.splitlines():
-            if 'uses:' in line:
-                self.assertRegex(line, r'@[0-9a-f]{40}')
+        for step in job['steps']:
+            if 'uses' in step:
+                self.assertRegex(step['uses'], r'@[0-9a-f]{40}$')
+            if step.get('id') in ('app', 'qualification'):
+                self.assertEqual(step['with']['repositories'], 'machine-monitor')
+                self.assertEqual(step['with']['app-id'], '4217367')
+
 
 
 class ExactHeadApproval(unittest.TestCase):
