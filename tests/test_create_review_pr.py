@@ -80,7 +80,7 @@ class CreationTests(unittest.TestCase):
         self.policy_value = {'schema': 'g1-review-enrollments/v1', 'repository_id': m.REPOSITORY_ID,
             'enabled': True, 'producers': [dict(id='work-local', origin_account='work', enabled=True,
                 github_user_id=m.OWNER_ID, cli_version=self.enrollment['cli_version'], credential_store='keyring',
-                instructions_sha256=m.review.digest(m.review.INSTRUCTIONS),
+                instructions_sha256=m.review.digest(m.review.INSTRUCTIONS), allowed_startup_notice_sha256=[],
                 creation_adapter_sha256=m.review.digest(Path(m.__file__).read_bytes()),
                 capture_adapter_sha256=m.review.digest(Path(m.review.__file__).read_bytes()))]}
         self.policy = m.review.canonical(self.policy_value).encode()
@@ -214,6 +214,20 @@ class CreationTests(unittest.TestCase):
             self.create()
         self.assert_no_origin()
         self.assertFalse(any(method == 'POST' and '/comments' in path for method, path, _ in self.api.calls))
+
+    def test_notice_must_be_enrolled_for_matched_producer(self):
+        notice = m.review.digest(next(iter(m.review.STARTUP_NOTICES)))
+        self.receipt['runtime']['startup_notice_sha256'] = [notice]
+        with self.assertRaises(m.review.CaptureError):
+            self.create()
+        self.assertEqual(self.api.calls, [])
+        self.assertFalse(self.journal.exists())
+        self.policy_value['producers'][0]['allowed_startup_notice_sha256'] = [notice]
+        self.policy = m.review.canonical(self.policy_value).encode()
+        self.request['policy_sha256'] = m.review.digest(self.policy)
+        self.receipt['tuple'] = copy.deepcopy(self.request)
+        self.create()
+        self.assertEqual(json.loads(self.journal.read_text())['status'], 'complete')
 
     def test_malformed_stale_wrong_binding_receipts(self):
         base = copy.deepcopy(self.receipt)

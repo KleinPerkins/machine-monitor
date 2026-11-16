@@ -74,7 +74,7 @@ def write_state(stream, value):
     os.fsync(stream.fileno())
 
 
-def validate_receipt(receipt, request, enrollment, now):
+def validate_receipt(receipt, request, enrollment, producer, now):
     fields = {'schema', 'capture_id', 'trust_model', 'tuple', 'reviewer_enrollment_id',
               'reviewer_origin_account', 'workspace_binding', 'instructions_sha256', 'runtime',
               'started_at', 'completed_at', 'review', 'report_sha256'}
@@ -93,7 +93,9 @@ def validate_receipt(receipt, request, enrollment, now):
             and isinstance(runtime['thread_id'], str) and len(runtime['thread_id']) >= 8, 'review runtime incomplete')
     require(isinstance(runtime['event_stream_sha256'], str)
             and re.fullmatch('[0-9a-f]{64}', runtime['event_stream_sha256']), 'direct event capture missing')
-    allowed = {review.digest(item) for item in review.STARTUP_NOTICES}
+    allowed = producer.get('allowed_startup_notice_sha256')
+    require(isinstance(allowed, list) and all(isinstance(item, str) and re.fullmatch('[0-9a-f]{64}', item) for item in allowed),
+            'invalid enrolled review notices')
     require(isinstance(runtime['startup_notice_sha256'], list)
             and all(isinstance(item, str) and item in allowed for item in runtime['startup_notice_sha256']), 'unqualified review notice')
     start, end = timestamp(receipt['started_at']), timestamp(receipt['completed_at'])
@@ -175,6 +177,7 @@ def validate_policy(policy, enrollment):
             and producer.get('creation_adapter_sha256') == review.digest(Path(__file__).read_bytes())
             and producer.get('capture_adapter_sha256') == review.digest(Path(review.__file__).read_bytes()),
             'unenrolled creation or capture adapter')
+    return producer
 
 
 def create(repo, request, policy, enrollment, receipt, title, body, output, journal, cli='codex', api=None):
@@ -184,13 +187,13 @@ def create(repo, request, policy, enrollment, receipt, title, body, output, jour
             and isinstance(body, str) and len(body.encode()) <= 60000
             and '<!-- g1-pr-' not in body, 'invalid title/body or supplied origin marker')
     require(request.get('repository') == REPOSITORY and request.get('repository_id') == REPOSITORY_ID, 'wrong repository request')
-    validate_policy(policy, enrollment)
+    producer = validate_policy(policy, enrollment)
     account = review.account_read(cli, enrollment['credential_store'])
     review.validate_enrollment(enrollment, account, request['origin_account'])
     version = review.run([cli, '--version']).decode().strip()
     require(version == enrollment['cli_version'], 'unenrolled CLI version')
     payload = review.frozen_input(repo, request, policy)
-    validate_receipt(receipt, request, enrollment, timestamp(review.utc()))
+    validate_receipt(receipt, request, enrollment, producer, timestamp(review.utc()))
     branch = review.git(repo, 'symbolic-ref', '--quiet', '--short', 'HEAD').decode().strip()
     require(branch and branch != 'main' and not any(c.isspace() for c in branch), 'delivery branch required')
     nonce, started = str(uuid.uuid4()), review.utc()
