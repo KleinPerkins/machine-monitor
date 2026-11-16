@@ -38,6 +38,8 @@
     "scope": "Existing six meaningful hosted CI shards plus automatic independent review from the PR-creation Codex account and Chaos Scheduler App-owned native squash delivery. No product, installed runtime or release change.",
     "review_trust": "Owner-enrolled operational local capture. Work and personal origins are distinct; a review receipt cannot establish origin. No provider-signature or same-principal anti-forgery claim.",
     "activation": "Source enrollment is not operational qualification. Retain current controls until the reviewed source lands and final current-main CI, account receipt admission, App readiness and owner-visible bypass policy have been verified. Agents do not merge, bypass checks or manipulate PR auto-merge.",
-    "reference": "KleinPerkins/kp-pr-bot-canary at 75148194a0e8b0f63674a3e441639cc633ca12b8; repository identity and CI evidence are adapted here."
+    "reference": "KleinPerkins/kp-pr-bot-canary at 75148194a0e8b0f63674a3e441639cc633ca12b8; repository identity and CI evidence are adapted here.",
+    "coordination": "The authoring agent automatically captures review, creates the PR/origin witness, and separately publishes the unedited review receipt with the g1-review-receipt:v1 marker. The creation adapter is deliberately origin-only. No human technical-review or receipt-publication step is required.",
+    "administrative_visibility": "The delivery coordinator must inspect exact owner-visible bypass actors before activation. App-scoped omission remains explicitly unknown; App qualification does not attest hidden actors. Visible unexpected actors reject, and Integration/App bypass is unauthorized. This accepted administrative boundary is operational trust, not protection against a privileged owner changing controls after qualification."
   }
 }
