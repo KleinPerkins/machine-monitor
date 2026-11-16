@@ -416,7 +416,7 @@ def snapshot(api, number, policy, policy_hash, now):
     base = api.request(prefix + '/git/ref/heads/main')['object']['sha']
     require(base == pr['base']['sha'], 'base moved')
     require(pr.get('mergeable') is True and pr.get('mergeable_state') in ('clean', 'blocked'), 'mergeability unknown/conflicting')
-    rules = api.request(prefix + '/rules/branches/main')
+    rules = api.pages(prefix + '/rules/branches/main')
     summaries = api.pages(prefix + '/rulesets?includes_parents=true')
     rulesets = [api.request(prefix + '/rulesets/' + str(s['id'])) for s in summaries]
     validate_controls(repo, rules, rulesets)
@@ -436,7 +436,7 @@ def snapshot(api, number, policy, policy_hash, now):
 def controls_snapshot(api, *, require_legacy=False, require_successor_only=False):
     prefix = '/repos/' + REPOSITORY
     repo = repository_snapshot(api)
-    rules = api.request(prefix + '/rules/branches/main')
+    rules = api.pages(prefix + '/rules/branches/main')
     summaries = api.pages(prefix + '/rulesets?includes_parents=true')
     rulesets = [api.request(prefix + '/rulesets/' + str(s['id'])) for s in summaries]
     validate_controls(repo, rules, rulesets, require_legacy=require_legacy,

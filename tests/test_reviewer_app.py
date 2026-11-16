@@ -209,6 +209,24 @@ class APIAndControlsTests(unittest.TestCase):
                dict(type='pull_request',ruleset_id=1,parameters=dict(required_approving_review_count=1,dismiss_stale_reviews_on_push=True,required_review_thread_resolution=True,allowed_merge_methods=['squash'])),
                dict(type='required_linear_history',ruleset_id=1),dict(type='deletion',ruleset_id=1),dict(type='non_fast_forward',ruleset_id=1)]
         return repo,rules,[dict(id=1,enforcement='active',bypass_actors=[dict(actor_id=5,actor_type='RepositoryRole',bypass_mode='pull_request')])]
+    def test_effective_rules_second_page_cannot_hide_an_unexpected_bypass(self):
+        repo,rules,sets=self.controls()
+        first=(rules*20)
+        second=[dict(type='non_fast_forward',ruleset_id=2)]
+        sets.append(dict(id=2,enforcement='active',bypass_actors=[dict(actor_id=123,actor_type='Integration',bypass_mode='always')]))
+        calls=[]
+        def request(path):
+            calls.append(path)
+            if '/rules/branches/main' in path:
+                return second if 'page=2' in path else first
+            if '/rulesets?' in path:return [{'id':1},{'id':2}]
+            if '/rulesets/' in path:return sets[int(path.rsplit('/',1)[1])-1]
+            raise AssertionError(path)
+        api=gate.API('fixture')
+        api.request=request
+        with patch.object(gate,'repository_snapshot',return_value=repo), self.assertRaisesRegex(gate.Rejected,'owner bypass exception changed'):
+            gate.controls_snapshot(api)
+        self.assertTrue(any('/rules/branches/main?' in p and 'page=2' in p for p in calls))
     def test_control_positive(self):gate.validate_controls(*self.controls())
     def test_owner_admin_pr_only_exception_preserved(self):
         repo,rules,sets=self.controls();sets[0]['bypass_actors']=[dict(actor_id=5,actor_type='RepositoryRole',bypass_mode='pull_request')]

@@ -21,7 +21,7 @@ def identity_require(condition, message):
         raise ValueError(message)
 
 
-def identity(environment: dict[str, str]) -> dict[str, str]:
+def hosted_identity(environment: dict[str, str]) -> dict[str, str]:
     names = ("GITHUB_REPOSITORY", "GITHUB_REPOSITORY_ID", "GITHUB_EVENT_NAME", "GITHUB_SHA",
              "GITHUB_WORKFLOW_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_REF",
              "CI_HEAD_SHA", "CI_BASE_SHA", "GITHUB_WORKFLOW_REF", "GITHUB_WORKFLOW")
@@ -193,7 +193,7 @@ def main():
         result = aggregate(value, reports, current)
         print(json.dumps(result, indent=2))
         if os.environ.get('GITHUB_ACTIONS') == 'true':
-            actual = identity(dict(os.environ))
+            actual = hosted_identity(dict(os.environ))
             identity_require(actual['revision'] == current, 'aggregate checkout differs from tested revision')
             print('MACHINE_MONITOR_CI_AGGREGATE_V1 ' + json.dumps({'schema': 'machine-monitor-ci-aggregate/v1', 'identity': actual, 'result': 'success'}, sort_keys=True, separators=(',', ':')))
         return

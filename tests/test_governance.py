@@ -103,7 +103,7 @@ class ShardContracts(unittest.TestCase):
 
 class RepositoryPolicy(unittest.TestCase):
     def test_hosted_aggregate_identity_rejects_wrong_run_source_and_pr_tuple(self):
-        from scripts.verify import identity
+        from scripts.verify import hosted_identity as identity
         expected = dict(GITHUB_REPOSITORY='KleinPerkins/machine-monitor',
                         GITHUB_REPOSITORY_ID='1449284973', GITHUB_EVENT_NAME='pull_request',
                         GITHUB_SHA='a' * 40, GITHUB_WORKFLOW_SHA='a' * 40,
@@ -112,6 +112,21 @@ class RepositoryPolicy(unittest.TestCase):
                         CI_BASE_SHA='c' * 40, GITHUB_WORKFLOW='CI',
                         GITHUB_WORKFLOW_REF='KleinPerkins/machine-monitor/.github/workflows/ci.yml@refs/pull/12/merge')
         self.assertEqual(identity(expected)['base_sha'], 'c' * 40)
+        # Exercise the real hosted aggregate entrypoint with inert fixture reports.
+        import contextlib, io, os, sys
+        from scripts import verify
+        value = contract(ROOT)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for shard in IDS:
+                common = dict(shard=shard, revision='a' * 40, contract_sha256=value['contract_sha256'])
+                (output / f'result-{shard}.json').write_text(json.dumps(dict(common, schema='dev-test-shard-result/v1', status='passed', tests=1)))
+                (output / f'invocation-{shard}.json').write_text(json.dumps(dict(common, schema='machine-monitor/shard-invocation/v1', run_id='github-123-2')))
+            stdout = io.StringIO()
+            with patch.dict(os.environ, dict(expected, GITHUB_ACTIONS='true')), patch.object(sys, 'argv', ['verify.py', 'aggregate', '--output', directory, '--revision', 'a' * 40, '--job-result', 'success']), contextlib.redirect_stdout(stdout):
+                verify.main()
+            self.assertIn('MACHINE_MONITOR_CI_AGGREGATE_V1 ', stdout.getvalue())
+
         for field, value in [('GITHUB_REPOSITORY_ID', '1297059298'),
                              ('GITHUB_EVENT_NAME', 'pull_request_target'),
                              ('GITHUB_WORKFLOW_SHA', 'd' * 40),
