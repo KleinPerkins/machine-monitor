@@ -41,6 +41,88 @@
     "reference": "KleinPerkins/kp-pr-bot-canary at 75148194a0e8b0f63674a3e441639cc633ca12b8; repository identity and CI evidence are adapted here.",
     "coordination": "The authoring agent automatically captures review, creates the PR/origin witness, and separately publishes the unedited review receipt with the g1-review-receipt:v1 marker. The creation adapter is deliberately origin-only. No human technical-review or receipt-publication step is required.",
     "administrative_visibility": "The delivery coordinator must inspect exact owner-visible bypass actors before activation. App-scoped omission remains explicitly unknown; App qualification does not attest hidden actors. Visible unexpected actors reject, and Integration/App bypass is unauthorized. This accepted administrative boundary is operational trust, not protection against a privileged owner changing controls after qualification.",
-    "ambiguous_creation": "An ambiguous create/origin-publication response deliberately blocks automatic delivery. The agent preserves the journal and diagnoses actual branch/nonce/PR/comment state read-only. No blind retry, duplicate PR or inferred account witness is authorized; automatic coordination does not require unconditional recovery from unknown origin."
+    "ambiguous_creation": "An ambiguous create/origin-publication response deliberately blocks automatic delivery. The agent preserves the journal and diagnoses actual branch/nonce/PR/comment state read-only. No blind retry, duplicate PR or inferred account witness is authorized; automatic coordination does not require unconditional recovery from unknown origin.",
+    "github_schema_observation": {
+      "observed_on": "2026-11-16",
+      "source": "https://api.github.com/graphql",
+      "query": "query { __type(name: \"EnablePullRequestAutoMergeInput\") { name inputFields { name type { kind name ofType { kind name } } } } }",
+      "response": {
+        "data": {
+          "__type": {
+            "name": "EnablePullRequestAutoMergeInput",
+            "inputFields": [
+              {
+                "name": "clientMutationId",
+                "type": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              },
+              {
+                "name": "pullRequestId",
+                "type": {
+                  "kind": "NON_NULL",
+                  "name": null,
+                  "ofType": {
+                    "kind": "SCALAR",
+                    "name": "ID"
+                  }
+                }
+              },
+              {
+                "name": "commitHeadline",
+                "type": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              },
+              {
+                "name": "commitBody",
+                "type": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              },
+              {
+                "name": "mergeMethod",
+                "type": {
+                  "kind": "ENUM",
+                  "name": "PullRequestMergeMethod",
+                  "ofType": null
+                }
+              },
+              {
+                "name": "authorEmail",
+                "type": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              },
+              {
+                "name": "expectedHeadOid",
+                "type": {
+                  "kind": "SCALAR",
+                  "name": "GitObjectID",
+                  "ofType": null
+                }
+              },
+              {
+                "name": "includeStack",
+                "type": {
+                  "kind": "SCALAR",
+                  "name": "Boolean",
+                  "ofType": null
+                }
+              }
+            ]
+          }
+        }
+      },
+      "scope": "Live public schema observation: expectedHeadOid is a supported GitObjectID input for enablePullRequestAutoMerge. It constrains head only; strict required checks and stale approval dismissal arbitrate base races. Schema availability is not proof of a particular merge."
+    }
   }
 }
