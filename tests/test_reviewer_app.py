@@ -228,6 +228,14 @@ class APIAndControlsTests(unittest.TestCase):
             gate.controls_snapshot(api)
         self.assertTrue(any('/rules/branches/main?' in p and 'page=2' in p for p in calls))
     def test_control_positive(self):gate.validate_controls(*self.controls())
+    def test_additional_human_review_gate_is_rejected(self):
+        for change in ({'required_approving_review_count': 2}, {'require_code_owner_review': True}, {'required_reviewers': [{'reviewer_id': 42, 'reviewer_type': 'Team'}]}):
+            with self.subTest(change=change):
+                repo,rules,sets=self.controls()
+                rules.append(dict(type='pull_request',ruleset_id=1,parameters=dict(rules[1]['parameters'], **change)))
+                with self.assertRaisesRegex(gate.Rejected,'additional reviewer requirement'):
+                    gate.validate_controls(repo,rules,sets)
+
     def test_owner_admin_pr_only_exception_preserved(self):
         repo,rules,sets=self.controls();sets[0]['bypass_actors']=[dict(actor_id=5,actor_type='RepositoryRole',bypass_mode='pull_request')]
         gate.validate_controls(repo,rules,sets)

@@ -157,7 +157,11 @@ def validate_controls(repo, rules, rulesets, *, require_legacy=False, require_su
     require(any(r.get('strict_required_status_checks_policy') is True and
                 any(c.get('context') == 'ci-required' and c.get('integration_id') == CI_APP_ID
                     for c in r.get('required_status_checks', [])) for r in required), 'strict CI15368 required')
-    require(any(r.get('required_approving_review_count', 0) >= 1 and r.get('dismiss_stale_reviews_on_push') is True
+    require(all(r.get('required_approving_review_count') == 1
+                and not r.get('require_code_owner_review', False)
+                and not r.get('required_reviewers', [])
+                for r in by_type.get('pull_request', [])), 'additional reviewer requirement')
+    require(any(r.get('required_approving_review_count') == 1 and r.get('dismiss_stale_reviews_on_push') is True
                 and r.get('required_review_thread_resolution') is True and r.get('allowed_merge_methods') == ['squash']
                 for r in by_type.get('pull_request', [])), 'review controls missing')
     require(all(name in by_type for name in ('required_linear_history', 'deletion', 'non_fast_forward')), 'history protection missing')
